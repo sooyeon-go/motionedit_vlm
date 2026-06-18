@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -64,20 +65,43 @@ MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
 
 PREALIGN_SYSTEM = """You are an expert visual geometry pre-alignment judge.
 
-Given a SOURCE image and a TARGET image, decide whether the SOURCE image should be
-coarsely aligned with deterministic image transforms BEFORE diffusion editing.
+Given a SOURCE image and a TARGET image, decide whether the SOURCE should receive
+deterministic flip/rotate transforms BEFORE diffusion editing.
 
-The goal is to preserve SOURCE object identity. Use the TARGET only as a geometry
-reference for broad object-facing direction and in-plane tilt. Do NOT suggest edits
-that require generating new object content.
+CRITICAL METHOD — two-landmark axis comparison:
+  You MUST pick exactly TWO landmarks that are BOTH:
+    1) clearly visible on the SOURCE object, AND
+    2) clearly visible on the TARGET object (as analogous parts).
+  These form primary_landmark + secondary_landmark and define an alignment axis.
+
+  NEVER pick a landmark that exists on only one image.
+  If you cannot find TWO shared landmarks on both source and target, skip pre-align.
+
+  Do NOT decide flip/rotate from a single landmark alone.
+  Compare the axis vector on SOURCE vs TARGET:
+    - horizontal flip: when BOTH landmarks are left/right mirrored as a pair
+    - in-plane rotation: when the primary→secondary axis angle differs
+
+Good landmark pairs (pick one pair visible on BOTH images):
+  - animals: head + tail, nose + tail, head + hind legs
+  - humans: head + feet, head + hips, shoulders + hips
+  - cars/vehicles: front bumper/headlights + rear bumper/taillights, front wheel + rear wheel
+  - rigid objects: tip + base, handle + spout, narrow end + wide end
+
+For each landmark, record its position in the IMAGE FRAME using:
+  horizontal: "left" | "center" | "right"
+  vertical:   "top" | "center" | "bottom"
+
+Use TARGET only as geometry reference. Preserve SOURCE identity. Never copy target identity.
 
 Allowed transforms:
-  - horizontal flip: useful when the source object faces the opposite left/right
-    direction from the target (cat/dog/person/car front/back orientation, etc.).
-  - small in-plane rotation: useful when the whole object/image is tilted.
+  - horizontal flip: when the TWO-landmark axis is horizontally MIRRORED
+    (primary and secondary swap left/right sides together).
+  - small in-plane rotation: when the primary→secondary axis angle differs between
+    source and target AFTER accounting for any needed flip.
 
-Do NOT use this for true 3D viewpoint changes (front view to side view), articulation,
-shape deformation, scale, or target identity transfer. Those belong to later planning.
+Do NOT use pre-align for: true 3D viewpoint change, articulation, deformation, scale,
+or any transform that would require generating new object content.
 
 Output valid JSON only."""
 
@@ -85,26 +109,63 @@ PREALIGN_USER = """Images provided:
   IMAGE 1 = SOURCE — the image/object to transform
   IMAGE 2 = TARGET — geometry reference only
 
-Decide whether deterministic pre-alignment should be applied before planning.
-Prioritize preserving the SOURCE object's identity over background preservation.
-Background changes caused by whole-image flip/rotate are acceptable.
+Step 1 — Pick exactly ONE landmark pair that exists on BOTH source AND target:
+  primary_landmark + secondary_landmark.
+  Both must be visible on SOURCE and on TARGET (analogous parts if cross-category).
+Step 2 — Record BOTH landmarks' frame positions on SOURCE and on TARGET.
+  If a landmark is missing on either image, mark comparable=false and skip pre-align.
+Step 3 — Compare the primary→secondary axis on source vs target.
+Step 4 — Decide horizontal flip from whether the pair is mirrored left/right.
+Step 5 — Decide rotation_degrees from axis-angle difference (in-plane only).
+Step 6 — Set confidence based on how clearly BOTH landmarks are visible.
 
 Return this exact schema:
 {{
-  "should_horizontal_flip": true | false,
+  "object_category": "cat | car | person | ...",
+  "alignment_axis": {{
+    "primary_landmark": "head",
+    "secondary_landmark": "tail",
+    "description": "head-to-tail body axis"
+  }},
+  "anchor_features": [
+    {{
+      "name": "head",
+      "role": "primary",
+      "visible_on_source": true,
+      "visible_on_target": true,
+      "source": {{"horizontal": "left", "vertical": "center"}},
+      "target": {{"horizontal": "right", "vertical": "center"}},
+      "comparable": true
+    }},
+    {{
+      "name": "tail",
+      "role": "secondary",
+      "visible_on_source": true,
+      "visible_on_target": true,
+      "source": {{"horizontal": "right", "vertical": "center"}},
+      "target": {{"horizontal": "left", "vertical": "center"}},
+      "comparable": true
+    }}
+  ],
+  "horizontal_layout_match": "same | mirrored | mixed | unclear",
+  "should_horizontal_flip": true,
   "rotation_degrees": 0.0,
+  "rotation_basis": "head→tail axis tilted ~10° clockwise in source vs target",
   "confidence": 0.0,
-  "reason": "...",
-  "source_facing": "...",
-  "target_facing": "..."
+  "reason": "short explanation citing BOTH landmark names and positions"
 }}
 
 Rules:
-  - Use horizontal flip only when it clearly improves the object's broad facing direction.
-  - rotation_degrees is a small in-plane correction in degrees.
-    Positive means counterclockwise, negative means clockwise.
-  - Keep rotation_degrees within -{max_rotation} to {max_rotation}.
-  - If uncertain, set confidence below {min_confidence} and avoid transforms."""
+  - Each landmark MUST be visible on BOTH source and target. Set visible_on_source/target accordingly.
+  - anchor_features MUST contain at least the primary and secondary landmarks, both comparable=true.
+  - Do NOT recommend flip or rotation unless BOTH shared landmarks are clear on BOTH images.
+  - If you cannot find two shared landmarks, set comparable=false, confidence below {min_confidence}, and skip.
+  - Recommend flip ONLY when horizontal_layout_match is "mirrored" for the pair.
+  - rotation_degrees: derived from primary→secondary axis angle difference.
+    Positive = counterclockwise. Keep within -{max_rotation} to {max_rotation}.
+  - If either landmark is missing/unclear, set confidence below {min_confidence} and skip transforms.
+  - Ignore background; focus on the two object landmarks.
+  - Cross-category pairs: map analogous parts (cat head ↔ dog head, car front ↔ car front)."""
 
 PLANNING_SYSTEM = """You are an expert visual geometry analyst and image editing planner.
 
@@ -147,6 +208,11 @@ A1. OBJECT CLASSIFICATION
   ANALOGOUS PARTS across the two objects for mapping.
 
 A2. TRANSFORM GAP ANALYSIS — assess each axis:
+  First pick a TWO-landmark axis on source and target
+  (head->tail, front->rear, tip->base) and note where each landmark sits in the frame
+  (left/center/right, top/center/bottom). Use this axis to reason about remaining gaps
+  after any pre-alignment.
+
   (a) VIEWPOINT
       - Azimuth change: clockwise/counterclockwise, estimated degrees
         (e.g., "source: front-facing → target: ~45° right-turn")
@@ -207,6 +273,9 @@ INSTRUCTION FORMAT — be specific and image-space concrete:
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
   - Prefer preserving background, lighting, and shadows, but do not sacrifice source identity for them
+  - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
+  - Do NOT plan coarse whole-object in-plane rotation unless fixing a small residual tilt
+  - Prefer instructions that reference identifiable parts/anchors (head, tail, wheel, hand)
   - Do NOT perform two dominant transforms in one step
   - Each step must move the configuration CLOSER to the target, never sideways
 
@@ -351,8 +420,14 @@ class PreAlignDecision:
     rotation_degrees: float
     confidence: float
     reason: str
-    source_facing: str = ""
-    target_facing: str = ""
+    object_category: str = ""
+    primary_landmark: str = ""
+    secondary_landmark: str = ""
+    anchor_features: list[dict[str, Any]] = field(default_factory=list)
+    horizontal_layout_match: str = ""
+    rotation_basis: str = ""
+    flip_votes_flip: int = 0
+    flip_votes_no_flip: int = 0
     applied_horizontal_flip: bool = False
     applied_rotation_degrees: float = 0.0
 
@@ -838,6 +913,326 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+_HORIZONTAL_POS = {"left": -1, "center": 0, "right": 1}
+_VERTICAL_POS = {"top": -1, "center": 0, "bottom": 1}
+
+
+def _normalize_axis_label(value: Any) -> str:
+    label = str(value or "").strip().lower()
+    if label in _HORIZONTAL_POS:
+        return label
+    if label in _VERTICAL_POS:
+        return label
+    if label in {"middle", "centre", "mid"}:
+        return "center"
+    if label in {"l"}:
+        return "left"
+    if label in {"r"}:
+        return "right"
+    if label in {"t", "up", "upper"}:
+        return "top"
+    if label in {"b", "down", "lower"}:
+        return "bottom"
+    return ""
+
+
+def _landmark_to_point(position: dict[str, Any]) -> Optional[tuple[float, float]]:
+    horizontal = _normalize_axis_label(position.get("horizontal"))
+    vertical = _normalize_axis_label(position.get("vertical"))
+    if horizontal not in _HORIZONTAL_POS or vertical not in _VERTICAL_POS:
+        return None
+    return (_HORIZONTAL_POS[horizontal], _VERTICAL_POS[vertical])
+
+
+def _landmark_present_on_both(anchor: dict[str, Any]) -> bool:
+    if not anchor.get("comparable", True):
+        return False
+    if anchor.get("visible_on_source") is False or anchor.get("visible_on_target") is False:
+        return False
+    source_point = _landmark_to_point(anchor.get("source") or {})
+    target_point = _landmark_to_point(anchor.get("target") or {})
+    return source_point is not None and target_point is not None
+
+
+def _bilateral_landmark_names(anchor_features: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for anchor in anchor_features:
+        name = str(anchor.get("name", "")).strip()
+        if name and _landmark_present_on_both(anchor):
+            names.append(name)
+    return names
+
+
+def _resolve_landmark_pair(parsed: dict[str, Any]) -> tuple[str, str]:
+    anchors = list(parsed.get("anchor_features") or [])
+    bilateral_names = set(_bilateral_landmark_names(anchors))
+
+    def _valid(name: str) -> bool:
+        return bool(name) and name in bilateral_names
+
+    axis = parsed.get("alignment_axis") or {}
+    primary = str(axis.get("primary_landmark", "")).strip()
+    secondary = str(axis.get("secondary_landmark", "")).strip()
+    if _valid(primary) and _valid(secondary):
+        return primary, secondary
+
+    by_role: dict[str, str] = {}
+    for anchor in anchors:
+        role = str(anchor.get("role", "")).strip().lower()
+        name = str(anchor.get("name", "")).strip()
+        if role in {"primary", "secondary"} and _valid(name):
+            by_role[role] = name
+    if "primary" in by_role and "secondary" in by_role:
+        return by_role["primary"], by_role["secondary"]
+
+    shared = _bilateral_landmark_names(anchors)
+    if len(shared) >= 2:
+        return shared[0], shared[1]
+    return "", ""
+
+
+def _find_landmark_anchor(
+    anchor_features: list[dict[str, Any]],
+    landmark_name: str,
+) -> Optional[dict[str, Any]]:
+    target_name = landmark_name.strip().lower()
+    for anchor in anchor_features:
+        if str(anchor.get("name", "")).strip().lower() == target_name:
+            return anchor
+    return None
+
+
+def _find_landmark_positions(
+    anchor_features: list[dict[str, Any]],
+    landmark_name: str,
+) -> tuple[Optional[tuple[float, float]], Optional[tuple[float, float]]]:
+    anchor = _find_landmark_anchor(anchor_features, landmark_name)
+    if anchor is None or not _landmark_present_on_both(anchor):
+        return None, None
+    source_point = _landmark_to_point(anchor.get("source") or {})
+    target_point = _landmark_to_point(anchor.get("target") or {})
+    return source_point, target_point
+
+
+def _mirror_point_x(point: tuple[float, float]) -> tuple[float, float]:
+    return (-point[0], point[1])
+
+
+def _axis_angle_degrees(
+    primary: tuple[float, float],
+    secondary: tuple[float, float],
+) -> Optional[float]:
+    dx = secondary[0] - primary[0]
+    dy = secondary[1] - primary[1]
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return None
+    return math.degrees(math.atan2(dy, dx))
+
+
+def _normalize_angle_delta(delta: float) -> float:
+    while delta > 180.0:
+        delta -= 360.0
+    while delta < -180.0:
+        delta += 360.0
+    return delta
+
+
+def _pair_flip_vote(
+    primary: str,
+    secondary: str,
+    anchor_features: list[dict[str, Any]],
+) -> tuple[int, int]:
+    votes_flip = 0
+    votes_no_flip = 0
+    for landmark_name in (primary, secondary):
+        source_point, target_point = _find_landmark_positions(anchor_features, landmark_name)
+        if source_point is None or target_point is None:
+            continue
+        if source_point[0] == 0.0 or target_point[0] == 0.0:
+            continue
+        if source_point[0] == target_point[0]:
+            votes_no_flip += 1
+        elif source_point[0] == -target_point[0]:
+            votes_flip += 1
+    return votes_flip, votes_no_flip
+
+
+def _compute_rotation_from_landmark_pair(
+    primary: str,
+    secondary: str,
+    anchor_features: list[dict[str, Any]],
+    should_flip: bool,
+    max_rotation: float,
+) -> tuple[float, str]:
+    src_primary, tgt_primary = _find_landmark_positions(anchor_features, primary)
+    src_secondary, tgt_secondary = _find_landmark_positions(anchor_features, secondary)
+    if None in (src_primary, tgt_primary, src_secondary, tgt_secondary):
+        return 0.0, ""
+
+    if should_flip:
+        src_primary = _mirror_point_x(src_primary)
+        src_secondary = _mirror_point_x(src_secondary)
+
+    source_angle = _axis_angle_degrees(src_primary, src_secondary)
+    target_angle = _axis_angle_degrees(tgt_primary, tgt_secondary)
+    if source_angle is None or target_angle is None:
+        return 0.0, ""
+
+    delta = _normalize_angle_delta(target_angle - source_angle)
+    if abs(delta) > max(max_rotation, 45.0):
+        return 0.0, (
+            f"{primary}->{secondary} axis gap too large for in-plane pre-align "
+            f"({delta:.1f} deg)"
+        )
+    delta = _clamp(delta, -max_rotation, max_rotation)
+    if abs(delta) < 3.0:
+        return 0.0, f"{primary}->{secondary} axis already aligned ({delta:.1f} deg residual)"
+    return (
+        delta,
+        f"{primary}->{secondary} axis: source {source_angle:.1f} deg vs "
+        f"target {target_angle:.1f} deg -> rotate {delta:.1f} deg",
+    )
+
+
+def _anchor_horizontal_votes(anchor_features: list[dict[str, Any]]) -> tuple[int, int]:
+    votes_flip = 0
+    votes_no_flip = 0
+    for anchor in anchor_features:
+        if not anchor.get("comparable", True):
+            continue
+        source_h = _normalize_axis_label((anchor.get("source") or {}).get("horizontal"))
+        target_h = _normalize_axis_label((anchor.get("target") or {}).get("horizontal"))
+        if source_h not in _HORIZONTAL_POS or target_h not in _HORIZONTAL_POS:
+            continue
+        if source_h == "center" or target_h == "center":
+            continue
+        if _HORIZONTAL_POS[source_h] == _HORIZONTAL_POS[target_h]:
+            votes_no_flip += 1
+        elif _HORIZONTAL_POS[source_h] == -_HORIZONTAL_POS[target_h]:
+            votes_flip += 1
+    return votes_flip, votes_no_flip
+
+
+def build_pre_align_decision(
+    parsed: dict[str, Any],
+    max_rotation: float = 30.0,
+) -> PreAlignDecision:
+    anchor_features = list(parsed.get("anchor_features") or [])
+    primary, secondary = _resolve_landmark_pair(parsed)
+    votes_flip, votes_no_flip = (
+        _pair_flip_vote(primary, secondary, anchor_features)
+        if primary and secondary
+        else _anchor_horizontal_votes(anchor_features)
+    )
+
+    layout = str(parsed.get("horizontal_layout_match", "")).strip().lower()
+    vlm_flip = bool(parsed.get("should_horizontal_flip", False))
+    confidence = float(parsed.get("confidence", 0.0))
+
+    has_landmark_pair = bool(primary and secondary)
+    src_primary, tgt_primary = _find_landmark_positions(anchor_features, primary) if primary else (None, None)
+    src_secondary, tgt_secondary = (
+        _find_landmark_positions(anchor_features, secondary) if secondary else (None, None)
+    )
+    pair_positions_ok = None not in (src_primary, tgt_primary, src_secondary, tgt_secondary)
+
+    should_flip = vlm_flip
+    if pair_positions_ok and votes_flip >= 2 and votes_flip > votes_no_flip:
+        should_flip = True
+        confidence = max(confidence, 0.70)
+    elif votes_no_flip >= 2 and votes_no_flip > votes_flip:
+        should_flip = False
+        if votes_flip > 0:
+            confidence = min(confidence, 0.55)
+    elif layout == "mirrored" and votes_flip >= 1 and votes_flip >= votes_no_flip:
+        should_flip = True
+    elif layout in {"same", "mixed", "unclear"} and votes_flip <= votes_no_flip:
+        should_flip = False
+        if layout in {"mixed", "unclear"}:
+            confidence = min(confidence, 0.50)
+
+    if not has_landmark_pair or not pair_positions_ok:
+        should_flip = False
+        confidence = min(confidence, 0.40)
+        if not has_landmark_pair:
+            reason_suffix = "No shared landmark pair found on both source and target."
+        else:
+            reason_suffix = (
+                f"Landmarks {primary}/{secondary} are not both present on source and target."
+            )
+        reason = str(parsed.get("reason", "")).strip()
+        if reason_suffix not in reason:
+            reason = f"{reason}. {reason_suffix}".strip(". ").strip()
+    else:
+        reason = str(parsed.get("reason", ""))
+
+    computed_rotation, computed_basis = (
+        _compute_rotation_from_landmark_pair(
+            primary,
+            secondary,
+            anchor_features,
+            should_flip=should_flip,
+            max_rotation=max_rotation,
+        )
+        if pair_positions_ok
+        else (0.0, "")
+    )
+
+    rotation = float(parsed.get("rotation_degrees", 0.0))
+    rotation_basis = str(parsed.get("rotation_basis", "")).strip()
+    if computed_basis:
+        rotation = computed_rotation
+        rotation_basis = computed_basis
+        if abs(computed_rotation) >= 3.0:
+            confidence = max(confidence, 0.65)
+    elif abs(rotation) >= 1.0 and not rotation_basis:
+        confidence = min(confidence, 0.50)
+        rotation = 0.0
+
+    if not pair_positions_ok:
+        rotation = 0.0
+        rotation_basis = ""
+
+    return PreAlignDecision(
+        should_horizontal_flip=should_flip,
+        rotation_degrees=rotation,
+        confidence=confidence,
+        reason=reason,
+        object_category=str(parsed.get("object_category", "")),
+        primary_landmark=primary,
+        secondary_landmark=secondary,
+        anchor_features=anchor_features,
+        horizontal_layout_match=layout,
+        rotation_basis=rotation_basis,
+        flip_votes_flip=votes_flip,
+        flip_votes_no_flip=votes_no_flip,
+    )
+
+
+def _format_anchor_summary(
+    anchor_features: list[dict[str, Any]],
+    primary_landmark: str = "",
+    secondary_landmark: str = "",
+) -> str:
+    lines: list[str] = []
+    if primary_landmark and secondary_landmark:
+        lines.append(f"  axis: {primary_landmark} -> {secondary_landmark}")
+    for anchor in anchor_features:
+        name = anchor.get("name", "anchor")
+        role = anchor.get("role", "")
+        role_suffix = f" [{role}]" if role else ""
+        source = anchor.get("source") or {}
+        target = anchor.get("target") or {}
+        on_both = _landmark_present_on_both(anchor)
+        both_tag = " [shared]" if on_both else " [NOT on both]"
+        lines.append(
+            f"  - {name}{role_suffix}{both_tag}: "
+            f"source=({source.get('horizontal', '?')}, {source.get('vertical', '?')}) "
+            f"target=({target.get('horizontal', '?')}, {target.get('vertical', '?')})"
+        )
+    return "\n".join(lines)
+
+
 def _background_fill_color(image: Image.Image) -> tuple[int, int, int]:
     arr = np.asarray(image.convert("RGB"))
     border = np.concatenate(
@@ -892,7 +1287,7 @@ def pre_align_source(
     max_rotation: float,
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
     log("\n========== Phase -1: Coarse Orientation Pre-Alignment ==========")
-    log("[prealign] Asking VLM whether flip/rotate is useful...")
+    log("[prealign] Selecting a two-landmark axis and comparing source vs target...")
     t0 = time.time()
     messages = [
         {"role": "system", "content": [{"type": "text", "text": PREALIGN_SYSTEM}]},
@@ -913,15 +1308,8 @@ def pre_align_source(
             ],
         },
     ]
-    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
-    decision = PreAlignDecision(
-        should_horizontal_flip=bool(parsed.get("should_horizontal_flip", False)),
-        rotation_degrees=float(parsed.get("rotation_degrees", 0.0)),
-        confidence=float(parsed.get("confidence", 0.0)),
-        reason=str(parsed.get("reason", "")),
-        source_facing=str(parsed.get("source_facing", "")),
-        target_facing=str(parsed.get("target_facing", "")),
-    )
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=1024))
+    decision = build_pre_align_decision(parsed, max_rotation=max_rotation)
     aligned = apply_pre_alignment(
         source_img=source_img,
         decision=decision,
@@ -934,10 +1322,25 @@ def pre_align_source(
 
     log(
         "[prealign] Done in "
-        f"{time.time() - t0:.1f}s | confidence={decision.confidence:.2f}, "
+        f"{time.time() - t0:.1f}s | category={decision.object_category or 'unknown'}, "
+        f"axis={decision.primary_landmark or '?'}->{decision.secondary_landmark or '?'}, "
+        f"layout={decision.horizontal_layout_match or 'unknown'}, "
+        f"anchor_votes flip={decision.flip_votes_flip} no_flip={decision.flip_votes_no_flip}, "
+        f"confidence={decision.confidence:.2f}, "
         f"flip={decision.applied_horizontal_flip}, "
         f"rotate={decision.applied_rotation_degrees:.1f}°"
     )
+    if decision.anchor_features:
+        log("[prealign] Landmark pair comparison:")
+        log(
+            _format_anchor_summary(
+                decision.anchor_features,
+                decision.primary_landmark,
+                decision.secondary_landmark,
+            )
+        )
+    if decision.rotation_basis:
+        log(f"[prealign] Rotation basis: {decision.rotation_basis}")
     if decision.reason:
         log(f"[prealign] Reason: {decision.reason}")
     log(f"[prealign] Wrote {prealign_path}")
@@ -960,10 +1363,15 @@ def plan(
     ):
         prealign_note = (
             "\n\nPre-alignment already applied to SOURCE before this planning step:\n"
+            f"- object_category: {pre_alignment.object_category}\n"
+            f"- landmark_axis: {pre_alignment.primary_landmark} -> {pre_alignment.secondary_landmark}\n"
             f"- horizontal_flip: {pre_alignment.applied_horizontal_flip}\n"
             f"- in_plane_rotation_degrees: {pre_alignment.applied_rotation_degrees:.1f}\n"
+            f"- anchor_layout: {pre_alignment.horizontal_layout_match}\n"
+            "Comparable landmark pairs were aligned (e.g. head->tail, front->rear). "
             "Do not repeat these coarse orientation transforms unless a small residual "
-            "correction is still clearly needed."
+            "correction is still clearly needed. Focus planning on pose, scale, "
+            "articulation, and viewpoint changes that flip/rotate cannot solve."
         )
     messages = [
         {"role": "system", "content": [{"type": "text", "text": PLANNING_SYSTEM}]},
