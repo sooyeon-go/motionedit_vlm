@@ -53,7 +53,7 @@ conda run -n "${ENV_NAME}" python -m pip install \
   "transformers>=4.57.0,<5.0" \
   "peft>=0.18.0" \
   "diffusers==0.36.0" \
-  "torchao>=0.16.0" \
+  "torchao>=0.16.0,<0.17.0" \
   "huggingface-hub>=0.34.0" \
   "qwen-vl-utils" \
   "accelerate" \
@@ -80,7 +80,7 @@ from huggingface_hub import snapshot_download, hf_hub_download
 tv = Version(transformers.__version__)
 assert Version("4.57.0") <= tv < Version("5.0.0")
 assert Version(peft.__version__) >= Version("0.18.0")
-assert Version(torchao.__version__) >= Version("0.16.0")
+assert Version("0.16.0") <= Version(torchao.__version__) < Version("0.17.0")
 _ = HybridCache
 print(f"transformers {transformers.__version__}, peft {peft.__version__}, torchao {torchao.__version__}")
 print("Key imports OK")

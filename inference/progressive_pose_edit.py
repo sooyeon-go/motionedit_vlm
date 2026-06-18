@@ -487,7 +487,7 @@ class QwenVLMClient:
 
 
 def _ensure_peft_torchao_compat() -> None:
-    """peft LoRA loading fails if an old torchao (<0.16.0) is installed."""
+    """peft LoRA loading needs torchao>=0.16; torchao>=0.17 needs torch>=2.11."""
     try:
         import torchao
     except ImportError:
@@ -496,14 +496,43 @@ def _ensure_peft_torchao_compat() -> None:
     from packaging.version import Version
 
     installed = Version(torchao.__version__)
+    torch_ver = Version(torch.__version__.split("+")[0])
+
+    if installed >= Version("0.17.0") and torch_ver < Version("2.11.0"):
+        raise ImportError(
+            f"torchao {torchao.__version__} requires torch>=2.11, "
+            f"but found {torch.__version__}.\n"
+            "Downgrade torchao for this environment:\n"
+            "  pip install 'torchao>=0.16.0,<0.17.0'\n"
+            "or run:\n"
+            "  bash tools/fix_dependencies.sh"
+        )
     if installed < Version("0.16.0"):
         raise ImportError(
             f"torchao {torchao.__version__} is too old for peft LoRA loading "
             f"(need >=0.16.0). Run:\n"
-            "  pip install 'torchao>=0.16.0'\n"
+            "  pip install 'torchao>=0.16.0,<0.17.0'\n"
             "or:\n"
             "  bash tools/fix_dependencies.sh"
         )
+
+
+def _check_runtime_dependencies() -> None:
+    """Validate the inference dependency stack before loading any models."""
+    _require_transformers_for_qwen3_vl()
+    _ensure_peft_torchao_compat()
+    try:
+        from transformers import AutoModelForImageTextToText, AutoProcessor  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Cannot import AutoProcessor from transformers. "
+            "Your env is likely broken after installing torchao>=0.17 with torch 2.6.\n"
+            "Fix with:\n"
+            "  bash tools/fix_dependencies.sh\n"
+            "or:\n"
+            "  pip install --force-reinstall 'transformers>=4.57.0,<5.0' "
+            "'torchao>=0.16.0,<0.17.0'"
+        ) from exc
 
 
 class MotionNFTEditor:
@@ -1386,6 +1415,10 @@ def main() -> None:
     log(f"target: {args.target_image}")
     log(f"output: {args.output_dir}")
     log(f"n_steps={args.n_steps}, max_retries={args.max_retries}, seed={args.seed}")
+
+    log("[deps] Checking runtime dependency versions...")
+    _check_runtime_dependencies()
+    log("[deps] OK")
 
     if not args.skip_path_check:
         validate_pretrained_paths(
