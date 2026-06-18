@@ -1,0 +1,12 @@
+# Pinned deps for inference/progressive_pose_edit.py
+# Qwen3-VL needs transformers>=4.57; transformers 5.x breaks peft HybridCache import.
+# peft LoRA loading needs torchao>=0.16.0 when torchao is installed.
+transformers>=4.57.0,<5.0
+peft>=0.18.0
+diffusers==0.36.0
+torchao>=0.16.0
+huggingface-hub>=0.34.0
+qwen-vl-utils
+accelerate
+safetensors
+packaging

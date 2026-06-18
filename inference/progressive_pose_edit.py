@@ -15,6 +15,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +24,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm import tqdm
+
+VERBOSE = True
+
+
+def log(msg: str) -> None:
+    if VERBOSE:
+        print(msg, flush=True)
+
+
+def save_image(image: Image.Image, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+    log(f"  saved {path}")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -409,6 +424,20 @@ def build_step(raw_step: dict[str, Any], fallback_step: int) -> SubInstruction:
 # ============================================================
 
 
+def _require_transformers_for_qwen3_vl() -> None:
+    """Qwen3-VL needs transformers>=4.57; transformers 5.x breaks peft HybridCache."""
+    import transformers
+    from packaging.version import Version
+
+    installed = Version(transformers.__version__)
+    if not (Version("4.57.0") <= installed < Version("5.0.0")):
+        raise ImportError(
+            f"Need transformers in [4.57.0, 5.0.0) for Qwen3-VL + MotionEdit, "
+            f"but found {transformers.__version__}. Run:\n"
+            "  bash tools/fix_dependencies.sh"
+        )
+
+
 class QwenVLMClient:
     """Small wrapper around Qwen VL chat generation."""
 
@@ -421,6 +450,7 @@ class QwenVLMClient:
         from qwen_vl_utils import process_vision_info
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
+        _require_transformers_for_qwen3_vl()
         self.process_vision_info = process_vision_info
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForImageTextToText.from_pretrained(
@@ -429,6 +459,7 @@ class QwenVLMClient:
             device_map=device_map,
         )
         self.model.eval()
+        self._device = next(self.model.parameters()).device
 
     @torch.no_grad()
     def chat(self, messages: list[dict[str, Any]], max_new_tokens: int) -> str:
@@ -445,7 +476,7 @@ class QwenVLMClient:
             padding=True,
             return_tensors="pt",
         )
-        inputs = inputs.to(self.model.device)
+        inputs = inputs.to(self._device)
         generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         generated_ids = generated_ids[:, inputs.input_ids.shape[1] :]
         return self.processor.batch_decode(
@@ -453,6 +484,26 @@ class QwenVLMClient:
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]
+
+
+def _ensure_peft_torchao_compat() -> None:
+    """peft LoRA loading fails if an old torchao (<0.16.0) is installed."""
+    try:
+        import torchao
+    except ImportError:
+        return
+
+    from packaging.version import Version
+
+    installed = Version(torchao.__version__)
+    if installed < Version("0.16.0"):
+        raise ImportError(
+            f"torchao {torchao.__version__} is too old for peft LoRA loading "
+            f"(need >=0.16.0). Run:\n"
+            "  pip install 'torchao>=0.16.0'\n"
+            "or:\n"
+            "  bash tools/fix_dependencies.sh"
+        )
 
 
 class MotionNFTEditor:
@@ -485,6 +536,7 @@ class MotionNFTEditor:
         self.guidance_scale = guidance_scale
         self.seed = seed
 
+        _ensure_peft_torchao_compat()
         if not lora_path:
             raise ValueError(
                 "motionedit_lora_path is required. "
@@ -658,7 +710,10 @@ def plan(
     target_img: Image.Image,
     planner_vlm: QwenVLMClient,
     n_steps: int,
+    output_dir: Optional[Path] = None,
 ) -> tuple[Analysis, list[SubInstruction], dict[str, Any]]:
+    log(f"[plan] Generating {n_steps}-step editing plan with VLM...")
+    t0 = time.time()
     messages = [
         {"role": "system", "content": [{"type": "text", "text": PLANNING_SYSTEM}]},
         {
@@ -677,6 +732,22 @@ def plan(
     steps = [build_step(step, idx + 1) for idx, step in enumerate(parsed["steps"])]
     if len(steps) != n_steps:
         raise ValueError(f"Planner returned {len(steps)} steps, expected {n_steps}.")
+
+    elapsed = time.time() - t0
+    src_desc = (analysis.source_description or "unknown")[:80]
+    tgt_desc = (analysis.target_description or "unknown")[:80]
+    log(f"[plan] Done in {elapsed:.1f}s — source: {src_desc}")
+    log(f"[plan] Target geometry ref: {tgt_desc}")
+    for step in steps:
+        log(
+            f"  step {step.step}/{n_steps} [{step.transform_type}] "
+            f"progress={step.cumulative_progress:.2f} | {step.instruction}"
+        )
+    if output_dir is not None:
+        plan_path = output_dir / "plan.json"
+        plan_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
+        log(f"[plan] Wrote {plan_path}")
+
     return analysis, steps, parsed
 
 
@@ -728,6 +799,8 @@ def replan(
     failure_reason: str,
     planner_vlm: QwenVLMClient,
 ) -> SubInstruction:
+    log(f"[replan] Asking VLM to revise step {failed_step.step} after failure: {failure_reason}")
+    t0 = time.time()
     messages = [
         {"role": "system", "content": [{"type": "text", "text": REPLAN_SYSTEM}]},
         {
@@ -753,7 +826,9 @@ def replan(
         },
     ]
     parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
-    return build_step(parsed, failed_step.step)
+    new_step = build_step(parsed, failed_step.step)
+    log(f"[replan] Done in {time.time() - t0:.1f}s — new instruction: {new_step.instruction}")
+    return new_step
 
 
 # ============================================================
@@ -876,6 +951,7 @@ def verify_edit(
     planner_vlm: Optional[QwenVLMClient],
     flow_threshold: float,
     skip_vlm_verify: bool,
+    verbose: bool = True,
 ) -> VerifyResult:
     identity_threshold = 0.80
     skip_flow_direction = False
@@ -902,6 +978,8 @@ def verify_edit(
         check_flow_roi = True
 
     flow = flow_estimator.estimate(before, after)
+    if verbose:
+        log(f"    [verify] optical flow computed ({flow.shape[1]}x{flow.shape[0]})")
     if skip_flow_direction:
         flow_direction_ok = True
         flow_magnitude_ok = True
@@ -934,6 +1012,11 @@ def verify_edit(
 
     identity_score = identity_scorer.similarity(before, after)
     identity_ok = identity_score > identity_threshold
+    if verbose:
+        log(
+            f"    [verify] flow direction={flow_direction_ok}, magnitude={flow_magnitude_ok} | "
+            f"DINO={identity_score:.3f} (threshold={identity_threshold:.2f})"
+        )
     texture_ok = True
     silhouette_ok = True
     background_ok = check_background_preservation(before, after)
@@ -962,6 +1045,8 @@ def verify_edit(
         objective_failures.append("Background changed in border regions")
 
     if objective_failures:
+        if verbose:
+            log(f"    [verify] objective check FAILED: {'; '.join(objective_failures)}")
         return VerifyResult(
             flow_direction_ok=flow_direction_ok,
             flow_magnitude_ok=flow_magnitude_ok,
@@ -975,6 +1060,8 @@ def verify_edit(
         )
 
     if skip_vlm_verify:
+        if verbose:
+            log("    [verify] VLM skipped (--skip_vlm_verify); objective checks passed")
         return VerifyResult(
             flow_direction_ok=flow_direction_ok,
             flow_magnitude_ok=flow_magnitude_ok,
@@ -990,7 +1077,19 @@ def verify_edit(
     if planner_vlm is None:
         raise ValueError("planner_vlm is required unless --skip_vlm_verify is set.")
 
+    if verbose:
+        log("    [verify] running VLM semantic checklist...")
     vlm_result = vlm_verify(before, after, target_img, step, planner_vlm)
+    if verbose:
+        log(
+            "    [verify] VLM: "
+            f"geometry={vlm_result.geometric_change_applied}, "
+            f"identity={vlm_result.identity_preserved}, "
+            f"background={vlm_result.background_unchanged}, "
+            f"plausible={vlm_result.physically_plausible}, "
+            f"artifacts_free={vlm_result.no_artifacts}, "
+            f"closer_to_target={vlm_result.closer_to_target}"
+        )
     background_ok = background_ok and vlm_result.background_unchanged
     overall = (
         flow_direction_ok
@@ -1053,7 +1152,11 @@ def execute_progressive(
     verify_results: list[VerifyResult] = []
     final_steps: list[SubInstruction] = []
 
-    for step_idx, step in enumerate(steps, start=1):
+    log(f"[execute] Starting progressive editing ({len(steps)} steps, max_retries={max_retries})")
+    step_bar = tqdm(steps, desc="Editing steps", unit="step", disable=not VERBOSE)
+
+    for step_idx, step in enumerate(step_bar, start=1):
+        step_bar.set_postfix(step=f"{step_idx}/{len(steps)}", type=step.transform_type)
         retry_count = 0
         current_step = step
         before = trajectory[-1]
@@ -1061,18 +1164,23 @@ def execute_progressive(
         verify: Optional[VerifyResult] = None
 
         while retry_count <= max_retries:
-            print(
-                f"[step {step_idx}/{len(steps)} retry {retry_count}] "
-                f"{current_step.instruction}"
+            log(
+                f"\n[step {step_idx}/{len(steps)} | retry {retry_count}/{max_retries}] "
+                f"[{current_step.transform_type}] {current_step.instruction}"
             )
+            t_edit = time.time()
+            log("  editing with MotionNFT...")
             edited = editor.edit(
                 source_img=before,
                 instruction=current_step.instruction,
                 step_seed=step_idx * 100 + retry_count,
             )
+            log(f"  edit done in {time.time() - t_edit:.1f}s")
             retry_path = output_dir / f"step_{step_idx:02d}_retry_{retry_count}.png"
-            edited.save(retry_path)
+            save_image(edited, retry_path)
 
+            log("  verifying edit...")
+            t_verify = time.time()
             verify = verify_edit(
                 before=before,
                 after=edited,
@@ -1084,13 +1192,15 @@ def execute_progressive(
                 flow_threshold=flow_threshold,
                 skip_vlm_verify=skip_vlm_verify,
             )
+            log(f"  verify done in {time.time() - t_verify:.1f}s")
 
             if verify.overall_ok:
-                print(f"[step {step_idx}] verification passed")
+                log(f"[step {step_idx}] PASSED")
                 break
 
-            print(f"[step {step_idx}] verification failed: {verify.failure_reason}")
+            log(f"[step {step_idx}] FAILED: {verify.failure_reason}")
             if retry_count >= max_retries:
+                log(f"[step {step_idx}] max retries reached; keeping last attempt")
                 break
             if planner_vlm is None:
                 raise ValueError("Replanning requires planner_vlm.")
@@ -1109,8 +1219,10 @@ def execute_progressive(
         trajectory.append(edited)
         final_steps.append(current_step)
         verify_results.append(verify)
-        edited.save(output_dir / f"step_{step_idx:02d}.png")
+        step_path = output_dir / f"step_{step_idx:02d}.png"
+        save_image(edited, step_path)
 
+    log(f"[execute] Finished all {len(steps)} steps")
     return trajectory, final_steps, verify_results
 
 
@@ -1127,11 +1239,11 @@ def progressive_pose_edit(
     flow_threshold: float = 0.5,
     skip_vlm_verify: bool = False,
 ) -> PipelineResult:
-    analysis, steps, raw_plan = plan(source_img, target_img, planner_vlm, n_steps)
-    (output_dir / "plan.json").write_text(
-        json.dumps(raw_plan, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    log("\n========== Phase 0: Planning ==========")
+    analysis, steps, raw_plan = plan(
+        source_img, target_img, planner_vlm, n_steps, output_dir=output_dir
     )
+    log("\n========== Phase 1: Progressive Execution ==========")
     trajectory, final_steps, verify_results = execute_progressive(
         source_img=source_img,
         target_img=target_img,
@@ -1245,6 +1357,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--true_cfg_scale", type=float, default=4.0)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--skip_vlm_verify", action="store_true")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable verbose progress logs (tqdm bar still shown).",
+    )
     return parser.parse_args()
 
 
@@ -1259,8 +1376,16 @@ def serializable_result(result: PipelineResult) -> dict[str, Any]:
 
 
 def main() -> None:
+    global VERBOSE
     args = parse_args()
+    VERBOSE = not args.quiet
     torch.manual_seed(args.seed)
+
+    log("========== Progressive Pose Edit ==========")
+    log(f"source: {args.source_image}")
+    log(f"target: {args.target_image}")
+    log(f"output: {args.output_dir}")
+    log(f"n_steps={args.n_steps}, max_retries={args.max_retries}, seed={args.seed}")
 
     if not args.skip_path_check:
         validate_pretrained_paths(
@@ -1271,28 +1396,36 @@ def main() -> None:
             unimatch_ckpt=args.unimatch_ckpt,
         )
 
-    print("[models] Using pretrained paths:")
-    print(f"  editor_base_model     = {args.editor_base_model}")
-    print(f"  motionedit_lora_path  = {args.motionedit_lora_path}")
-    print(f"  planner_vlm           = {args.planner_vlm}")
-    print(f"  dinov2_model          = {args.dinov2_model}")
-    print(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
+    log("\n[models] Using pretrained paths:")
+    log(f"  editor_base_model     = {args.editor_base_model}")
+    log(f"  motionedit_lora_path  = {args.motionedit_lora_path}")
+    log(f"  planner_vlm           = {args.planner_vlm}")
+    log(f"  dinov2_model          = {args.dinov2_model}")
+    log(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
 
     source_img = Image.open(args.source_image).convert("RGB")
     target_img = Image.open(args.target_image).convert("RGB")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    source_img.save(output_dir / "step_00.png")
-    source_img.save(output_dir / "source.png")
-    target_img.save(output_dir / "target.png")
+    log("\n[init] Saving input images")
+    save_image(source_img, output_dir / "step_00.png")
+    save_image(source_img, output_dir / "source.png")
+    save_image(target_img, output_dir / "target.png")
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
+
+    log("\n[load] Planner VLM (Qwen3-VL)...")
+    t0 = time.time()
     planner_vlm = QwenVLMClient(
         model_id=args.planner_vlm,
         device_map=args.vlm_device_map,
         torch_dtype="auto",
     )
+    log(f"[load] Planner VLM ready ({time.time() - t0:.1f}s)")
+
+    log("[load] MotionNFT editor (Qwen Image Edit + LoRA)...")
+    t0 = time.time()
     editor = MotionNFTEditor(
         base_model=args.editor_base_model,
         lora_path=args.motionedit_lora_path,
@@ -1304,13 +1437,23 @@ def main() -> None:
         guidance_scale=args.guidance_scale,
         seed=args.seed,
     )
+    log(f"[load] MotionNFT editor ready ({time.time() - t0:.1f}s)")
+
+    log("[load] UniMatch optical flow...")
+    t0 = time.time()
     flow_estimator = UniMatchFlowEstimator(
         ckpt_path=Path(args.unimatch_ckpt),
         device=args.device,
         resize_to=args.flow_resize_to,
     )
-    identity_scorer = DINOv2IdentityScorer(args.dinov2_model, args.device)
+    log(f"[load] UniMatch ready ({time.time() - t0:.1f}s)")
 
+    log("[load] DINOv2 identity scorer...")
+    t0 = time.time()
+    identity_scorer = DINOv2IdentityScorer(args.dinov2_model, args.device)
+    log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
+
+    pipeline_t0 = time.time()
     result = progressive_pose_edit(
         source_img=source_img,
         target_img=target_img,
@@ -1324,12 +1467,21 @@ def main() -> None:
         flow_threshold=args.flow_threshold,
         skip_vlm_verify=args.skip_vlm_verify,
     )
-    result.final_img.save(output_dir / "final.png")
-    (output_dir / "result.json").write_text(
+    log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
+
+    log("\n[output] Writing final artifacts")
+    save_image(result.final_img, output_dir / "final.png")
+    result_path = output_dir / "result.json"
+    result_path.write_text(
         json.dumps(serializable_result(result), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    print(f"Saved progressive editing outputs to {output_dir}")
+    log(f"  saved {result_path}")
+    log(f"\nDone. Outputs in {output_dir}")
+    log("  step_00.png .. step_NN.png  — editing trajectory")
+    log("  plan.json                   — VLM editing plan")
+    log("  final.png                   — final result")
+    log("  result.json                 — analysis + verify summary")
 
 
 if __name__ == "__main__":
