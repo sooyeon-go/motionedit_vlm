@@ -175,6 +175,13 @@ progressively transform the SOURCE object's spatial configuration (viewpoint, sc
 pose, deformation) to match the TARGET object's — while keeping everything else
 (especially object identity, texture, color, and material) unchanged.
 
+CRITICAL — instruction style for the editor:
+  Each step's "instruction" field is sent DIRECTLY to an image editing diffusion model.
+  That model understands natural, descriptive action language much better than numeric
+  geometry (degrees, percentages, ratios).
+  Write instructions like a human photo editor would — describing what should happen
+  in plain visual terms, referencing body parts and spatial relations.
+
 Key principle:
   You are NOT replacing the source object with the target.
   You are ONLY changing its geometric configuration.
@@ -211,24 +218,22 @@ A2. TRANSFORM GAP ANALYSIS — assess each axis:
   First pick a TWO-landmark axis on source and target
   (head->tail, front->rear, tip->base) and note where each landmark sits in the frame
   (left/center/right, top/center/bottom). Use this axis to reason about remaining gaps
-  after any pre-alignment.
+  after any pre-alignment. Describe gaps in VISUAL terms, not numeric angles.
 
   (a) VIEWPOINT
-      - Azimuth change: clockwise/counterclockwise, estimated degrees
-        (e.g., "source: front-facing → target: ~45° right-turn")
-      - Elevation change: up/down tilt, estimated degrees
-      - In-plane rotation: rotation within the image plane, estimated degrees
+      - How does the viewing angle differ? (e.g., "source faces camera, target shows
+        right-side profile", "source is front-facing, target looks down from above")
+      - Describe as spatial relations, NOT degrees.
 
   (b) SCALE
-      - How much larger/smaller is the target object relative to the source?
-        Express as a ratio (e.g., "target is ~1.4× larger")
+      - How does object size differ? (e.g., "target appears noticeably larger",
+        "target fills more of the frame")
 
   (c) DEFORMATION / ARTICULATION (skip if both objects are rigid)
-      For each movable part, describe:
-      - source state: current configuration
-      - target state: desired configuration
-      - estimated delta: specific and measurable
-        (e.g., "left knee: 160°→90° flex", "chair back: vertical→60° recline")
+      For each movable part, describe source vs target in pose language:
+      - source state: current configuration (e.g., "front legs straight, head up")
+      - target state: desired configuration (e.g., "front legs bent, head lowered")
+      - delta: what needs to change (e.g., "bend front legs and lower head")
 
   (d) TRANSLATION
       - Where is the object in the image frame?
@@ -252,30 +257,40 @@ ORDERING PRIORITY (coarse → fine):
   5. Translation and fine adjustments last
 
 STEP SIZE CONSTRAINT:
-  Each step must be small enough that EVERY part of the object remains individually
-  identifiable and trackable from the immediately preceding frame.
-  This is critical: the output sequence will be used for correspondence matching,
-  so each frame pair must be matchable by a standard feature matcher.
-  Rule of thumb:
-    - Viewpoint: ≤ 20° per step
-    - In-plane rotation: ≤ 15° per step
-    - Scale: ≤ 20% change per step
-    - Articulation: ≤ 20° per joint per step
+  Each step must be a SMALL, incremental change — one clear visual adjustment.
+  Every part of the object must remain individually identifiable from the previous frame.
+  Each step should be matchable by a standard feature matcher (small motion only).
 
-INSTRUCTION FORMAT — be specific and image-space concrete:
-  Good: "Rotate the entire object ~15° clockwise within the image plane"
-  Good: "Scale the object up by ~15%, keeping it centered"
-  Good: "Fold the left armrest down by ~25° toward the seat"
-  Bad:  "Adjust the object forward" (not measurable)
-  Bad:  "Change the pose" (too vague)
-  Bad:  "Make it look like the target" (not actionable)
+INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
+  The "instruction" field goes directly to the image editor. Write it as a clear,
+  single-action sentence describing what should visually change. Reference specific
+  body parts and spatial directions.
+
+  GOOD examples (use this style):
+    "Have the cat turn its head and upper body slightly toward the right side of the image."
+    "Make the cat lower its front paws and tuck its hind legs closer to its body."
+    "Have the car turn away from the camera to reveal more of its left side."
+    "Make the cat appear slightly larger while keeping it centered in the frame."
+    "Have the cat arch its back and raise its tail slightly upward."
+    "Make the person bend forward at the waist while keeping their feet in place."
+
+  BAD examples (do NOT use):
+    "Rotate the object 90 degrees clockwise"          ← editor does not understand degrees
+    "Rotate ~15° within the image plane"              ← numeric angles fail
+    "Scale up by 20%"                                 ← percentages fail
+    "Adjust the object forward"                       ← too vague
+    "Change the pose"                                 ← too vague
+    "Make it look like the target"                    ← not actionable
+
+  Also write "expected_change" in the same natural descriptive style (no degrees/%).
 
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
   - Prefer preserving background, lighting, and shadows, but do not sacrifice source identity for them
   - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
-  - Do NOT plan coarse whole-object in-plane rotation unless fixing a small residual tilt
-  - Prefer instructions that reference identifiable parts/anchors (head, tail, wheel, hand)
+  - Do NOT plan coarse whole-object rotation unless fixing a small residual tilt
+  - Use identifiable parts in instructions (head, tail, paws, wheels, hands, etc.)
+  - Do NOT use degree numbers, percentages, or ratio values in "instruction"
   - Do NOT perform two dominant transforms in one step
   - Each step must move the configuration CLOSER to the target, never sideways
 
@@ -321,11 +336,11 @@ OUTPUT JSON SCHEMA
   "steps": [
     {{
       "step": 1,
-      "instruction": "...",
+      "instruction": "natural descriptive edit prompt sent to the image editor",
       "transform_type": "viewpoint_azimuth | viewpoint_elevation | inplane_rotation | scale | articulation | translation | fine_adjustment",
       "affected_parts": ["..."],
-      "expected_change": "...",
-      "magnitude_estimate": "...",
+      "expected_change": "same natural-language description of what should visually change",
+      "magnitude_estimate": "small | moderate (qualitative only, no numbers)",
       "cumulative_progress": 0.0,
       "identity_warning": "none | check_texture | check_silhouette"
     }}
@@ -369,6 +384,8 @@ Format:
 REPLAN_SYSTEM = """You are a motion editing planner.
 A previous editing step failed verification.
 Analyze the failure and produce a corrected instruction.
+The instruction goes directly to an image editing model — use natural descriptive
+action language (body parts, spatial directions), NOT degrees or percentages.
 Output valid JSON only."""
 
 REPLAN_USER = """IMAGE 1 = BEFORE edit
@@ -385,13 +402,18 @@ Expected change: {expected_change}
 Identity warning: {identity_warning}
 Failure reason: {failure_reason}
 
+Write the corrected instruction as a natural edit prompt, e.g.:
+  "Have the cat turn its head and body slightly toward the left."
+  "Make the cat lower its front paws while keeping its hind legs in place."
+Do NOT use degree numbers or percentages.
+
 Analyze why it failed and provide a CORRECTED instruction:
 {{
-  "instruction": "...",
+  "instruction": "natural descriptive edit prompt",
   "transform_type": "...",
   "affected_parts": ["..."],
-  "expected_change": "...",
-  "magnitude_estimate": "...",
+  "expected_change": "natural-language description of visual change",
+  "magnitude_estimate": "small | moderate",
   "cumulative_progress": ...,
   "identity_warning": "none | check_texture | check_silhouette"
 }}"""
