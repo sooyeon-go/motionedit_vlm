@@ -22,8 +22,18 @@ from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_SCRIPTS_DIR = REPO_ROOT / "train" / "scripts"
-if str(TRAIN_SCRIPTS_DIR) not in sys.path:
-    sys.path.append(str(TRAIN_SCRIPTS_DIR))
+TOOLS_DIR = REPO_ROOT / "tools"
+for path in (TRAIN_SCRIPTS_DIR, TOOLS_DIR):
+    if str(path) not in sys.path:
+        sys.path.append(str(path))
+
+from model_paths import (  # noqa: E402
+    DINOV2_MODEL,
+    EDITOR_BASE_MODEL,
+    MOTIONEDIT_LORA_DIR,
+    PLANNER_VLM_MODEL,
+    UNIMATCH_CKPT,
+)
 
 
 # ============================================================
@@ -1151,20 +1161,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_retries", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--editor_base_model", default="Qwen/Qwen-Image-Edit-2509")
-    parser.add_argument("--motionedit_lora_path", default=None)
-    parser.add_argument("--planner_vlm", default="Qwen/Qwen3-VL-8B-Instruct")
-    parser.add_argument("--dinov2_model", default="facebook/dinov2-base")
+    parser.add_argument(
+        "--editor_base_model",
+        default=str(EDITOR_BASE_MODEL),
+        help="Qwen Image Edit base (default: shared Qwen-Image-Edit-2511).",
+    )
+    parser.add_argument(
+        "--motionedit_lora_path",
+        default=str(MOTIONEDIT_LORA_DIR),
+        help="Local MotionEdit LoRA directory.",
+    )
+    parser.add_argument(
+        "--planner_vlm",
+        default=str(PLANNER_VLM_MODEL),
+        help="Planner/verifier VLM (default: shared Qwen3-VL-8B-Instruct).",
+    )
+    parser.add_argument(
+        "--dinov2_model",
+        default=str(DINOV2_MODEL),
+        help="DINOv2 identity scorer (default: motionedit_vlm/dinov2-base).",
+    )
     parser.add_argument(
         "--unimatch_ckpt",
-        default=str(
-            REPO_ROOT
-            / "train"
-            / "scripts"
-            / "unimatch"
-            / "pretrained"
-            / "gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth"
-        ),
+        default=str(UNIMATCH_CKPT),
+        help="UniMatch optical flow checkpoint.",
     )
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

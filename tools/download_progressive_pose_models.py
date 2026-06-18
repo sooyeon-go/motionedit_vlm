@@ -1,11 +1,13 @@
 """Download models needed by inference/progressive_pose_edit.py from Hugging Face.
 
-The progressive pipeline uses:
-  - Qwen/Qwen-Image-Edit-2509 as the editor base model
-  - elaine1wan/motionedit as the MotionEdit LoRA adapter
-  - Qwen/Qwen3-VL-8B-Instruct as the planner/verifier VLM
-  - facebook/dinov2-base as the source identity scorer
-  - haofeixu/unimatch Space checkpoint for optical flow
+Models already on shared storage (not downloaded here):
+  - /data/shared-vilab/pretrained_models/Qwen-Image-Edit-2511
+  - /data/shared-vilab/pretrained_models/Qwen3-VL-8B-Instruct
+
+Downloaded into /data/shared-vilab/pretrained_models/motionedit_vlm/:
+  - motionedit-lora/          (elaine1wan/motionedit adapter)
+  - dinov2-base/              (facebook/dinov2-base)
+  - unimatch/pretrained/...   (UniMatch optical flow checkpoint)
 
 Example:
   python tools/download_progressive_pose_models.py
@@ -19,13 +21,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from model_paths import (  # noqa: E402
+    DINOV2_MODEL,
+    EDITOR_BASE_MODEL,
+    MOTIONEDIT_LORA_DIR,
+    MOTIONEDIT_VLM_DIR,
+    PLANNER_VLM_MODEL,
+    UNIMATCH_CKPT,
+    UNIMATCH_DIR,
+)
+
 DEFAULT_UNIMATCH_FILENAME = (
     "pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth"
 )
@@ -77,14 +92,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--models_dir",
-        default=str(REPO_ROOT / "models" / "hf"),
-        help="Local directory for large HF snapshots.",
+        default=str(MOTIONEDIT_VLM_DIR),
+        help="Directory for motionedit_vlm assets (LoRA, DINOv2, UniMatch).",
     )
     parser.add_argument("--hf_token", default=None, help="Optional Hugging Face token.")
 
-    parser.add_argument("--editor_base_repo", default="Qwen/Qwen-Image-Edit-2509")
     parser.add_argument("--motionedit_lora_repo", default="elaine1wan/motionedit")
-    parser.add_argument("--planner_vlm_repo", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--dinov2_repo", default="facebook/dinov2-base")
 
     parser.add_argument(
@@ -105,16 +118,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--unimatch_output_root",
-        default=str(REPO_ROOT / "train" / "scripts" / "unimatch"),
-        help=(
-            "Download root for UniMatch. With the default filename, the final file "
-            "lands in train/scripts/unimatch/pretrained/."
-        ),
+        default=str(UNIMATCH_DIR),
+        help="Download root for UniMatch (file lands under pretrained/).",
     )
 
-    parser.add_argument("--skip_editor_base", action="store_true")
     parser.add_argument("--skip_motionedit_lora", action="store_true")
-    parser.add_argument("--skip_planner_vlm", action="store_true")
     parser.add_argument("--skip_dinov2", action="store_true")
     parser.add_argument("--skip_unimatch", action="store_true")
     return parser.parse_args()
@@ -124,19 +132,17 @@ def main() -> None:
     args = parse_args()
     token = _token(args.hf_token)
     models_dir = Path(args.models_dir)
-    manifest: dict[str, str] = {}
-
-    if not args.skip_editor_base:
-        manifest["editor_base"] = download_snapshot(
-            repo_id=args.editor_base_repo,
-            destination=models_dir / "Qwen-Image-Edit-2509",
-            token=token,
-        )
+    manifest: dict[str, str] = {
+        "editor_base": str(EDITOR_BASE_MODEL),
+        "planner_vlm": str(PLANNER_VLM_MODEL),
+        "note": (
+            "editor_base and planner_vlm are expected to already exist on shared "
+            "storage and are not downloaded by this script."
+        ),
+    }
 
     if not args.skip_motionedit_lora:
         lora_dir = models_dir / "motionedit-lora"
-        # Only the adapter is needed for inference. The HF repo also contains
-        # optimizer/scaler training artifacts that are not required here.
         manifest["motionedit_lora_adapter"] = download_file(
             repo_id=args.motionedit_lora_repo,
             filename="adapter_model_converted.safetensors",
@@ -147,13 +153,6 @@ def main() -> None:
             repo_id=args.motionedit_lora_repo,
             filename="adapter_config.json",
             destination_root=lora_dir,
-            token=token,
-        )
-
-    if not args.skip_planner_vlm:
-        manifest["planner_vlm"] = download_snapshot(
-            repo_id=args.planner_vlm_repo,
-            destination=models_dir / "Qwen3-VL-8B-Instruct",
             token=token,
         )
 
@@ -180,15 +179,10 @@ def main() -> None:
     print("\n[download] Done. Manifest:")
     print(json.dumps(manifest, indent=2))
     print(f"\n[download] Wrote {manifest_path}")
-    print("\nExample local run arguments:")
-    print(f"  --editor_base_model {models_dir / 'Qwen-Image-Edit-2509'}")
-    print(f"  --motionedit_lora_path {models_dir / 'motionedit-lora'}")
-    print(f"  --planner_vlm {models_dir / 'Qwen3-VL-8B-Instruct'}")
-    print(f"  --dinov2_model {models_dir / 'dinov2-base'}")
-    print(
-        "  --unimatch_ckpt "
-        f"{Path(args.unimatch_output_root) / args.unimatch_filename}"
-    )
+    print("\nRun progressive pose editing with defaults (no extra model args needed):")
+    print("  python inference/progressive_pose_edit.py \\")
+    print("    --source_image path/to/source.png \\")
+    print("    --target_image path/to/target.png")
 
 
 if __name__ == "__main__":

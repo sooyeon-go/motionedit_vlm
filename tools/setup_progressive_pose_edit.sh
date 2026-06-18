@@ -10,6 +10,11 @@ set -euo pipefail
 #   ENV_NAME=motionedit bash tools/setup_progressive_pose_edit.sh
 #   SKIP_FLASH_ATTN=1 bash tools/setup_progressive_pose_edit.sh
 #   DOWNLOAD_MODELS=1 HF_TOKEN=... bash tools/setup_progressive_pose_edit.sh
+#
+# Models layout (shared storage):
+#   /data/shared-vilab/pretrained_models/Qwen-Image-Edit-2511   (already present)
+#   /data/shared-vilab/pretrained_models/Qwen3-VL-8B-Instruct   (already present)
+#   /data/shared-vilab/pretrained_models/motionedit_vlm/        (downloaded by script)
 
 ENV_NAME="${ENV_NAME:-motionedit}"
 SKIP_FLASH_ATTN="${SKIP_FLASH_ATTN:-0}"
