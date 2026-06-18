@@ -165,7 +165,7 @@ def install_hf_stack(strategy: str) -> None:
         "install",
         "transformers>=4.57.0,<5.0",
         "peft>=0.18.0",
-        "diffusers==0.36.0",
+        "diffusers>=0.37.0,<0.39.0",
         torchao_spec,
         "huggingface-hub>=0.34.0",
         "qwen-vl-utils",
@@ -173,6 +173,8 @@ def install_hf_stack(strategy: str) -> None:
         "safetensors",
         "packaging",
         "numpy<2",
+        "cffi",
+        "soundfile",
     )
 
 

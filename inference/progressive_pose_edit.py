@@ -486,6 +486,24 @@ class QwenVLMClient:
         )[0]
 
 
+def _ensure_diffusers_torchao_compat() -> None:
+    """diffusers 0.36 breaks when torchao>=0.16 (logger/uint4 import bug)."""
+    try:
+        import diffusers
+    except ImportError:
+        return
+
+    from packaging.version import Version
+
+    installed = Version(diffusers.__version__)
+    if installed < Version("0.37.0"):
+        raise ImportError(
+            f"diffusers {diffusers.__version__} is incompatible with torchao>=0.16.\n"
+            "Upgrade with:\n"
+            '  pip install "diffusers>=0.37.0,<0.39.0"'
+        )
+
+
 def _ensure_peft_torchao_compat() -> None:
     """peft LoRA loading needs torchao>=0.16; torchao>=0.17 needs torch>=2.11."""
     try:
@@ -541,6 +559,7 @@ def _check_runtime_dependencies() -> None:
     _check_torch_vision_compat()
     _require_transformers_for_qwen3_vl()
     _ensure_peft_torchao_compat()
+    _ensure_diffusers_torchao_compat()
     try:
         from transformers import AutoModelForImageTextToText, AutoProcessor  # noqa: F401
     except (ImportError, ModuleNotFoundError, RuntimeError) as exc:

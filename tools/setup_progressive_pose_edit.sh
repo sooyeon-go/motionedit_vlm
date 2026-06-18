@@ -52,13 +52,15 @@ echo "[setup] Installing/updating runtime helpers for Qwen3-VL + MotionEdit"
 conda run -n "${ENV_NAME}" python -m pip install \
   "transformers>=4.57.0,<5.0" \
   "peft>=0.18.0" \
-  "diffusers==0.36.0" \
+  "diffusers>=0.37.0,<0.39.0" \
   "torchao>=0.16.0,<0.17.0" \
   "huggingface-hub>=0.34.0" \
   "qwen-vl-utils" \
   "accelerate" \
   "safetensors" \
-  "packaging"
+  "packaging" \
+  "cffi" \
+  "soundfile"
 
 if [ "${SKIP_FLASH_ATTN}" != "1" ]; then
   echo "[setup] Installing flash-attn. Set SKIP_FLASH_ATTN=1 to skip this."
