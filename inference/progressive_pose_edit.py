@@ -502,37 +502,60 @@ def _ensure_peft_torchao_compat() -> None:
         raise ImportError(
             f"torchao {torchao.__version__} requires torch>=2.11, "
             f"but found {torch.__version__}.\n"
-            "Downgrade torchao for this environment:\n"
-            "  pip install 'torchao>=0.16.0,<0.17.0'\n"
-            "or run:\n"
-            "  bash tools/fix_dependencies.sh"
+            "Run:\n"
+            "  python tools/repair_torch_stack.py --strategy motionedit"
         )
     if installed < Version("0.16.0"):
         raise ImportError(
             f"torchao {torchao.__version__} is too old for peft LoRA loading "
             f"(need >=0.16.0). Run:\n"
-            "  pip install 'torchao>=0.16.0,<0.17.0'\n"
-            "or:\n"
-            "  bash tools/fix_dependencies.sh"
+            "  python tools/repair_torch_stack.py"
         )
+
+
+def _check_torch_vision_compat() -> None:
+    """torch and torchvision must be installed as a matched pair."""
+    try:
+        import torchvision
+        from torchvision.transforms import InterpolationMode  # noqa: F401
+    except Exception as exc:
+        tv_ver = "unknown"
+        try:
+            import torchvision as tv
+
+            tv_ver = tv.__version__
+        except Exception:
+            pass
+        raise ImportError(
+            f"torch/torchvision mismatch (torch={torch.__version__}, "
+            f"torchvision={tv_ver}).\n"
+            "Run:\n"
+            "  python tools/repair_torch_stack.py --strategy match-current\n"
+            "or:\n"
+            "  STRATEGY=match-current bash tools/fix_dependencies.sh"
+        ) from exc
 
 
 def _check_runtime_dependencies() -> None:
     """Validate the inference dependency stack before loading any models."""
+    _check_torch_vision_compat()
     _require_transformers_for_qwen3_vl()
     _ensure_peft_torchao_compat()
     try:
         from transformers import AutoModelForImageTextToText, AutoProcessor  # noqa: F401
-    except ImportError as exc:
+    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
         raise ImportError(
-            "Cannot import AutoProcessor from transformers. "
-            "Your env is likely broken after installing torchao>=0.17 with torch 2.6.\n"
+            "Cannot import AutoProcessor from transformers.\n"
+            "Common causes:\n"
+            "  1) torch/torchvision version mismatch\n"
+            "  2) broken transformers install\n"
+            "  3) incompatible torchao version\n"
             "Fix with:\n"
-            "  bash tools/fix_dependencies.sh\n"
-            "or:\n"
-            "  pip install --force-reinstall 'transformers>=4.57.0,<5.0' "
-            "'torchao>=0.16.0,<0.17.0'"
+            "  python tools/repair_torch_stack.py --strategy match-current"
         ) from exc
+    import torchvision
+
+    log(f"[deps] torch {torch.__version__}, torchvision {torchvision.__version__}")
 
 
 class MotionNFTEditor:
