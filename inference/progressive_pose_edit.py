@@ -1,7 +1,12 @@
 """Progressive pose editing with MotionNFT, VLM planning, flow, and identity checks.
 
-This script builds on the MotionEdit README inference path:
-Qwen-Image-Edit-2509 + the MotionEdit LoRA adapter.
+Default model layout on shared storage:
+  /data/shared-vilab/pretrained_models/Qwen-Image-Edit-2511      (editor base)
+  /data/shared-vilab/pretrained_models/Qwen3-VL-8B-Instruct      (planner / verifier VLM)
+  /data/shared-vilab/pretrained_models/motionedit_vlm/
+    motionedit-lora/                                             (MotionEdit LoRA)
+    dinov2-base/                                                 (identity scorer)
+    unimatch/pretrained/gmflow-...pth                            (optical flow)
 """
 
 from __future__ import annotations
@@ -28,12 +33,14 @@ for path in (TRAIN_SCRIPTS_DIR, TOOLS_DIR):
         sys.path.append(str(path))
 
 from model_paths import (  # noqa: E402
-    DINOV2_MODEL,
-    EDITOR_BASE_MODEL,
-    MOTIONEDIT_LORA_DIR,
-    PLANNER_VLM_MODEL,
-    UNIMATCH_CKPT,
+    DINOV2_MODEL as DEFAULT_DINOV2_MODEL,
+    EDITOR_BASE_MODEL as DEFAULT_EDITOR_BASE_MODEL,
+    MOTIONEDIT_LORA_DIR as DEFAULT_MOTIONEDIT_LORA_PATH,
+    PLANNER_VLM_MODEL as DEFAULT_PLANNER_VLM,
+    UNIMATCH_CKPT as DEFAULT_UNIMATCH_CKPT,
 )
+
+MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
 
 
 # ============================================================
@@ -478,10 +485,14 @@ class MotionNFTEditor:
         self.guidance_scale = guidance_scale
         self.seed = seed
 
-        adapter_source = lora_path or "elaine1wan/motionedit"
+        if not lora_path:
+            raise ValueError(
+                "motionedit_lora_path is required. "
+                f"Expected local adapter at {DEFAULT_MOTIONEDIT_LORA_PATH}"
+            )
         self.pipe.load_lora_weights(
-            adapter_source,
-            weight_name="adapter_model_converted.safetensors",
+            lora_path,
+            weight_name=MOTIONEDIT_LORA_WEIGHT,
             adapter_name="lora",
         )
         self.pipe.set_adapters(["lora"], adapter_weights=[1])
@@ -1150,6 +1161,39 @@ def progressive_pose_edit(
 # ============================================================
 
 
+def validate_pretrained_paths(
+    editor_base_model: str,
+    motionedit_lora_path: str,
+    planner_vlm: str,
+    dinov2_model: str,
+    unimatch_ckpt: str,
+) -> None:
+    """Fail fast with clear errors if shared model paths are missing."""
+    checks: list[tuple[str, Path, bool]] = [
+        ("editor_base_model", Path(editor_base_model), True),
+        ("planner_vlm", Path(planner_vlm), True),
+        ("dinov2_model", Path(dinov2_model), True),
+        ("unimatch_ckpt", Path(unimatch_ckpt), False),
+        (
+            "motionedit_lora",
+            Path(motionedit_lora_path) / MOTIONEDIT_LORA_WEIGHT,
+            False,
+        ),
+    ]
+    missing: list[str] = []
+    for name, path, is_dir in checks:
+        if is_dir and not path.is_dir():
+            missing.append(f"  - {name}: {path} (directory not found)")
+        elif not is_dir and not path.is_file():
+            missing.append(f"  - {name}: {path} (file not found)")
+    if missing:
+        raise FileNotFoundError(
+            "Missing pretrained model paths:\n"
+            + "\n".join(missing)
+            + "\n\nRun: python tools/download_progressive_pose_models.py"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate step-by-step MotionNFT pose edits from source and target images.",
@@ -1163,28 +1207,33 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--editor_base_model",
-        default=str(EDITOR_BASE_MODEL),
-        help="Qwen Image Edit base (default: shared Qwen-Image-Edit-2511).",
+        default=str(DEFAULT_EDITOR_BASE_MODEL),
+        help="Editor base model path (default: .../Qwen-Image-Edit-2511).",
     )
     parser.add_argument(
         "--motionedit_lora_path",
-        default=str(MOTIONEDIT_LORA_DIR),
-        help="Local MotionEdit LoRA directory.",
+        default=str(DEFAULT_MOTIONEDIT_LORA_PATH),
+        help="MotionEdit LoRA directory (default: .../motionedit_vlm/motionedit-lora).",
     )
     parser.add_argument(
         "--planner_vlm",
-        default=str(PLANNER_VLM_MODEL),
-        help="Planner/verifier VLM (default: shared Qwen3-VL-8B-Instruct).",
+        default=str(DEFAULT_PLANNER_VLM),
+        help="Planner/verifier VLM path (default: .../Qwen3-VL-8B-Instruct).",
     )
     parser.add_argument(
         "--dinov2_model",
-        default=str(DINOV2_MODEL),
-        help="DINOv2 identity scorer (default: motionedit_vlm/dinov2-base).",
+        default=str(DEFAULT_DINOV2_MODEL),
+        help="DINOv2 path (default: .../motionedit_vlm/dinov2-base).",
     )
     parser.add_argument(
         "--unimatch_ckpt",
-        default=str(UNIMATCH_CKPT),
-        help="UniMatch optical flow checkpoint.",
+        default=str(DEFAULT_UNIMATCH_CKPT),
+        help="UniMatch checkpoint (default: .../motionedit_vlm/unimatch/pretrained/...).",
+    )
+    parser.add_argument(
+        "--skip_path_check",
+        action="store_true",
+        help="Skip local pretrained path existence checks.",
     )
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1212,6 +1261,22 @@ def serializable_result(result: PipelineResult) -> dict[str, Any]:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
+
+    if not args.skip_path_check:
+        validate_pretrained_paths(
+            editor_base_model=args.editor_base_model,
+            motionedit_lora_path=args.motionedit_lora_path,
+            planner_vlm=args.planner_vlm,
+            dinov2_model=args.dinov2_model,
+            unimatch_ckpt=args.unimatch_ckpt,
+        )
+
+    print("[models] Using pretrained paths:")
+    print(f"  editor_base_model     = {args.editor_base_model}")
+    print(f"  motionedit_lora_path  = {args.motionedit_lora_path}")
+    print(f"  planner_vlm           = {args.planner_vlm}")
+    print(f"  dinov2_model          = {args.dinov2_model}")
+    print(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
 
     source_img = Image.open(args.source_image).convert("RGB")
     target_img = Image.open(args.target_image).convert("RGB")
