@@ -62,18 +62,63 @@ MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
 # PROMPTS
 # ============================================================
 
+PREALIGN_SYSTEM = """You are an expert visual geometry pre-alignment judge.
+
+Given a SOURCE image and a TARGET image, decide whether the SOURCE image should be
+coarsely aligned with deterministic image transforms BEFORE diffusion editing.
+
+The goal is to preserve SOURCE object identity. Use the TARGET only as a geometry
+reference for broad object-facing direction and in-plane tilt. Do NOT suggest edits
+that require generating new object content.
+
+Allowed transforms:
+  - horizontal flip: useful when the source object faces the opposite left/right
+    direction from the target (cat/dog/person/car front/back orientation, etc.).
+  - small in-plane rotation: useful when the whole object/image is tilted.
+
+Do NOT use this for true 3D viewpoint changes (front view to side view), articulation,
+shape deformation, scale, or target identity transfer. Those belong to later planning.
+
+Output valid JSON only."""
+
+PREALIGN_USER = """Images provided:
+  IMAGE 1 = SOURCE — the image/object to transform
+  IMAGE 2 = TARGET — geometry reference only
+
+Decide whether deterministic pre-alignment should be applied before planning.
+Prioritize preserving the SOURCE object's identity over background preservation.
+Background changes caused by whole-image flip/rotate are acceptable.
+
+Return this exact schema:
+{{
+  "should_horizontal_flip": true | false,
+  "rotation_degrees": 0.0,
+  "confidence": 0.0,
+  "reason": "...",
+  "source_facing": "...",
+  "target_facing": "..."
+}}
+
+Rules:
+  - Use horizontal flip only when it clearly improves the object's broad facing direction.
+  - rotation_degrees is a small in-plane correction in degrees.
+    Positive means counterclockwise, negative means clockwise.
+  - Keep rotation_degrees within -{max_rotation} to {max_rotation}.
+  - If uncertain, set confidence below {min_confidence} and avoid transforms."""
+
 PLANNING_SYSTEM = """You are an expert visual geometry analyst and image editing planner.
 
 Your task: given a SOURCE image and a TARGET image containing objects of POSSIBLY
 DIFFERENT categories, plan a minimal sequence of small incremental image edits that
 progressively transform the SOURCE object's spatial configuration (viewpoint, scale,
 pose, deformation) to match the TARGET object's — while keeping everything else
-(object identity, texture, color, material, background) completely unchanged.
+(especially object identity, texture, color, and material) unchanged.
 
 Key principle:
   You are NOT replacing the source object with the target.
   You are ONLY changing its geometric configuration.
   The source object must remain exactly what it is.
+  Background preservation is helpful but secondary to source identity preservation.
 
 Output valid JSON only. No prose, no markdown fences outside JSON."""
 
@@ -161,7 +206,7 @@ INSTRUCTION FORMAT — be specific and image-space concrete:
 
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
-  - Do NOT change: background, lighting, shadows (unless unavoidably caused by viewpoint)
+  - Prefer preserving background, lighting, and shadows, but do not sacrifice source identity for them
   - Do NOT perform two dominant transforms in one step
   - Each step must move the configuration CLOSER to the target, never sideways
 
@@ -239,7 +284,7 @@ Expected change: {expected_change}
 Answer Yes or No for each:
 1. Was the instructed geometric change applied? (viewpoint/scale/pose as specified)
 2. Is the source object's identity preserved? (same category, texture, color, material)
-3. Is the background unchanged?
+3. Is the background broadly acceptable? (not a strict pass/fail criterion)
 4. Is the change physically/geometrically plausible?
 5. Are there no visual artifacts?
 6. After this edit, is the source object's configuration CLOSER to the TARGET than before?
@@ -301,6 +346,18 @@ class SubInstruction:
 
 
 @dataclass
+class PreAlignDecision:
+    should_horizontal_flip: bool
+    rotation_degrees: float
+    confidence: float
+    reason: str
+    source_facing: str = ""
+    target_facing: str = ""
+    applied_horizontal_flip: bool = False
+    applied_rotation_degrees: float = 0.0
+
+
+@dataclass
 class Analysis:
     source_description: str
     source_deformability: str
@@ -349,6 +406,7 @@ class PipelineResult:
     instructions: list[SubInstruction]
     verify_results: list[VerifyResult]
     final_img: Image.Image
+    pre_alignment: Optional[PreAlignDecision] = None
 
 
 # ============================================================
@@ -776,15 +834,137 @@ class DINOv2IdentityScorer:
 # ============================================================
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _background_fill_color(image: Image.Image) -> tuple[int, int, int]:
+    arr = np.asarray(image.convert("RGB"))
+    border = np.concatenate(
+        [
+            arr[0, :, :],
+            arr[-1, :, :],
+            arr[:, 0, :],
+            arr[:, -1, :],
+        ],
+        axis=0,
+    )
+    return tuple(int(channel) for channel in np.median(border, axis=0))
+
+
+def apply_pre_alignment(
+    source_img: Image.Image,
+    decision: PreAlignDecision,
+    min_confidence: float,
+    max_rotation: float,
+) -> Image.Image:
+    aligned = source_img
+    if decision.confidence < min_confidence:
+        decision.applied_horizontal_flip = False
+        decision.applied_rotation_degrees = 0.0
+        return aligned
+
+    if decision.should_horizontal_flip:
+        aligned = aligned.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        decision.applied_horizontal_flip = True
+
+    rotation = _clamp(decision.rotation_degrees, -max_rotation, max_rotation)
+    if abs(rotation) >= 1.0:
+        aligned = aligned.rotate(
+            rotation,
+            resample=Image.Resampling.BICUBIC,
+            expand=False,
+            fillcolor=_background_fill_color(aligned),
+        )
+        decision.applied_rotation_degrees = rotation
+    else:
+        decision.applied_rotation_degrees = 0.0
+
+    return aligned
+
+
+def pre_align_source(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    output_dir: Path,
+    min_confidence: float,
+    max_rotation: float,
+) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
+    log("\n========== Phase -1: Coarse Orientation Pre-Alignment ==========")
+    log("[prealign] Asking VLM whether flip/rotate is useful...")
+    t0 = time.time()
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": PREALIGN_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": source_img},
+                {"type": "text", "text": "(IMAGE 1 = SOURCE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {
+                    "type": "text",
+                    "text": PREALIGN_USER.format(
+                        min_confidence=min_confidence,
+                        max_rotation=max_rotation,
+                    ),
+                },
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    decision = PreAlignDecision(
+        should_horizontal_flip=bool(parsed.get("should_horizontal_flip", False)),
+        rotation_degrees=float(parsed.get("rotation_degrees", 0.0)),
+        confidence=float(parsed.get("confidence", 0.0)),
+        reason=str(parsed.get("reason", "")),
+        source_facing=str(parsed.get("source_facing", "")),
+        target_facing=str(parsed.get("target_facing", "")),
+    )
+    aligned = apply_pre_alignment(
+        source_img=source_img,
+        decision=decision,
+        min_confidence=min_confidence,
+        max_rotation=max_rotation,
+    )
+    parsed.update(asdict(decision))
+    prealign_path = output_dir / "pre_alignment.json"
+    prealign_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    log(
+        "[prealign] Done in "
+        f"{time.time() - t0:.1f}s | confidence={decision.confidence:.2f}, "
+        f"flip={decision.applied_horizontal_flip}, "
+        f"rotate={decision.applied_rotation_degrees:.1f}°"
+    )
+    if decision.reason:
+        log(f"[prealign] Reason: {decision.reason}")
+    log(f"[prealign] Wrote {prealign_path}")
+    return aligned, decision, parsed
+
+
 def plan(
     source_img: Image.Image,
     target_img: Image.Image,
     planner_vlm: QwenVLMClient,
     n_steps: int,
     output_dir: Optional[Path] = None,
+    pre_alignment: Optional[PreAlignDecision] = None,
 ) -> tuple[Analysis, list[SubInstruction], dict[str, Any]]:
     log(f"[plan] Generating {n_steps}-step editing plan with VLM...")
     t0 = time.time()
+    prealign_note = ""
+    if pre_alignment is not None and (
+        pre_alignment.applied_horizontal_flip or abs(pre_alignment.applied_rotation_degrees) > 0
+    ):
+        prealign_note = (
+            "\n\nPre-alignment already applied to SOURCE before this planning step:\n"
+            f"- horizontal_flip: {pre_alignment.applied_horizontal_flip}\n"
+            f"- in_plane_rotation_degrees: {pre_alignment.applied_rotation_degrees:.1f}\n"
+            "Do not repeat these coarse orientation transforms unless a small residual "
+            "correction is still clearly needed."
+        )
     messages = [
         {"role": "system", "content": [{"type": "text", "text": PLANNING_SYSTEM}]},
         {
@@ -794,7 +974,7 @@ def plan(
                 {"type": "text", "text": "(IMAGE 1 = SOURCE)"},
                 {"type": "image", "image": target_img},
                 {"type": "text", "text": "(IMAGE 2 = TARGET)"},
-                {"type": "text", "text": PLANNING_USER.format(n_steps=n_steps)},
+                {"type": "text", "text": PLANNING_USER.format(n_steps=n_steps) + prealign_note},
             ],
         },
     ]
@@ -1112,8 +1292,6 @@ def verify_edit(
         objective_failures.append("Texture changed unexpectedly")
     if not silhouette_ok:
         objective_failures.append("Silhouette did not move toward target")
-    if not background_ok:
-        objective_failures.append("Background changed in border regions")
 
     if objective_failures:
         if verbose:
@@ -1156,7 +1334,7 @@ def verify_edit(
             "    [verify] VLM: "
             f"geometry={vlm_result.geometric_change_applied}, "
             f"identity={vlm_result.identity_preserved}, "
-            f"background={vlm_result.background_unchanged}, "
+            f"background={vlm_result.background_unchanged} (non-blocking), "
             f"plausible={vlm_result.physically_plausible}, "
             f"artifacts_free={vlm_result.no_artifacts}, "
             f"closer_to_target={vlm_result.closer_to_target}"
@@ -1173,7 +1351,6 @@ def verify_edit(
         and vlm_result.physically_plausible
         and vlm_result.no_artifacts
         and vlm_result.closer_to_target
-        and background_ok
     )
 
     failure_reason = None
@@ -1183,8 +1360,6 @@ def verify_edit(
             reasons.append("Geometric change not applied as instructed")
         if not vlm_result.identity_preserved:
             reasons.append("VLM: identity not preserved")
-        if not background_ok:
-            reasons.append("Background changed")
         if not vlm_result.physically_plausible:
             reasons.append("Change not physically plausible")
         if not vlm_result.no_artifacts:
@@ -1309,10 +1484,16 @@ def progressive_pose_edit(
     max_retries: int = 2,
     flow_threshold: float = 0.5,
     skip_vlm_verify: bool = False,
+    pre_alignment: Optional[PreAlignDecision] = None,
 ) -> PipelineResult:
     log("\n========== Phase 0: Planning ==========")
     analysis, steps, raw_plan = plan(
-        source_img, target_img, planner_vlm, n_steps, output_dir=output_dir
+        source_img,
+        target_img,
+        planner_vlm,
+        n_steps,
+        output_dir=output_dir,
+        pre_alignment=pre_alignment,
     )
     log("\n========== Phase 1: Progressive Execution ==========")
     trajectory, final_steps, verify_results = execute_progressive(
@@ -1336,6 +1517,7 @@ def progressive_pose_edit(
         instructions=final_steps,
         verify_results=verify_results,
         final_img=trajectory[-1],
+        pre_alignment=pre_alignment,
     )
 
 
@@ -1429,6 +1611,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--skip_vlm_verify", action="store_true")
     parser.add_argument(
+        "--skip_pre_align",
+        action="store_true",
+        help="Disable VLM-guided deterministic flip/rotate before planning.",
+    )
+    parser.add_argument(
+        "--pre_align_min_confidence",
+        type=float,
+        default=0.60,
+        help="Minimum VLM confidence required to apply pre-alignment.",
+    )
+    parser.add_argument(
+        "--max_pre_align_rotation",
+        type=float,
+        default=30.0,
+        help="Maximum absolute in-plane pre-alignment rotation in degrees.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable verbose progress logs (tqdm bar still shown).",
@@ -1438,6 +1637,7 @@ def parse_args() -> argparse.Namespace:
 
 def serializable_result(result: PipelineResult) -> dict[str, Any]:
     return {
+        "pre_alignment": asdict(result.pre_alignment) if result.pre_alignment is not None else None,
         "analysis": asdict(result.analysis),
         "instructions": [asdict(step) for step in result.instructions],
         "verify_results": [asdict(verify) for verify in result.verify_results],
@@ -1484,7 +1684,6 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log("\n[init] Saving input images")
-    save_image(source_img, output_dir / "step_00.png")
     save_image(source_img, output_dir / "source.png")
     save_image(target_img, output_dir / "target.png")
 
@@ -1498,6 +1697,23 @@ def main() -> None:
         torch_dtype="auto",
     )
     log(f"[load] Planner VLM ready ({time.time() - t0:.1f}s)")
+
+    aligned_source_img = source_img
+    pre_alignment: Optional[PreAlignDecision] = None
+    if args.skip_pre_align:
+        log("\n[prealign] Skipped (--skip_pre_align)")
+        save_image(aligned_source_img, output_dir / "step_00.png")
+    else:
+        aligned_source_img, pre_alignment, _ = pre_align_source(
+            source_img=source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            output_dir=output_dir,
+            min_confidence=args.pre_align_min_confidence,
+            max_rotation=args.max_pre_align_rotation,
+        )
+        save_image(aligned_source_img, output_dir / "aligned_source.png")
+        save_image(aligned_source_img, output_dir / "step_00.png")
 
     log("[load] MotionNFT editor (Qwen Image Edit + LoRA)...")
     t0 = time.time()
@@ -1530,7 +1746,7 @@ def main() -> None:
 
     pipeline_t0 = time.time()
     result = progressive_pose_edit(
-        source_img=source_img,
+        source_img=aligned_source_img,
         target_img=target_img,
         planner_vlm=planner_vlm,
         editor=editor,
@@ -1541,6 +1757,7 @@ def main() -> None:
         max_retries=args.max_retries,
         flow_threshold=args.flow_threshold,
         skip_vlm_verify=args.skip_vlm_verify,
+        pre_alignment=pre_alignment,
     )
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
 
