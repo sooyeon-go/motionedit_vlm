@@ -140,6 +140,8 @@ def run_single_pair(
         skip_trajectory_vlm=args.skip_trajectory_vlm,
         trajectory_flow_ratio=args.trajectory_flow_ratio,
         pre_alignment=pre_alignment,
+        skip_trajectory_repair=args.skip_trajectory_repair,
+        max_trajectory_repairs=args.max_trajectory_repairs,
     )
 
     ppe.save_image(result.final_img, output_dir / "final.png")
@@ -248,6 +250,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip_vlm_verify", action="store_true")
     parser.add_argument("--skip_trajectory_vlm", action="store_true")
     parser.add_argument("--trajectory_flow_ratio", type=float, default=4.0)
+    parser.add_argument("--max_trajectory_repairs", type=int, default=2)
+    parser.add_argument("--skip_trajectory_repair", action="store_true")
     parser.add_argument("--skip_pre_align", action="store_true")
     parser.add_argument("--pre_align_min_confidence", type=float, default=0.60)
     parser.add_argument("--max_pre_align_rotation", type=float, default=30.0)

@@ -601,6 +601,7 @@ class TrajectoryVerifyResult:
     vlm: Optional[TrajectoryVLMVerifyResult]
     overall_ok: bool
     failure_reason: Optional[str] = None
+    suspect_steps: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -614,6 +615,7 @@ class PipelineResult:
     final_img: Image.Image
     pre_alignment: Optional[PreAlignDecision] = None
     trajectory_verify: Optional[TrajectoryVerifyResult] = None
+    trajectory_repair: Optional[list[dict[str, Any]]] = None
 
 
 # ============================================================
@@ -1900,6 +1902,49 @@ def verify_trajectory_flow(
     )
 
 
+def identify_suspect_steps(
+    flow_result: TrajectoryFlowVerifyResult,
+    verify_results: list[VerifyResult],
+    vlm_result: Optional[TrajectoryVLMVerifyResult],
+) -> list[int]:
+    """Rank 1-based editing steps most likely responsible for trajectory issues."""
+    scores: dict[int, float] = {}
+
+    for issue in flow_result.issues:
+        for match in re.finditer(r"step (\d+)->(\d+)", issue):
+            to_step = int(match.group(2))
+            from_step = int(match.group(1))
+            if to_step > 0:
+                scores[to_step] = scores.get(to_step, 0.0) + 2.0
+            if from_step > 0:
+                scores[from_step] = scores.get(from_step, 0.0) + 1.0
+        for match in re.finditer(r"between step (\d+) and (\d+)", issue):
+            left = int(match.group(1))
+            right = int(match.group(2))
+            scores[right] = scores.get(right, 0.0) + 1.5
+            scores[left] = scores.get(left, 0.0) + 1.0
+
+    for step_idx, verify in enumerate(verify_results, start=1):
+        if not verify.overall_ok:
+            scores[step_idx] = scores.get(step_idx, 0.0) + 1.0
+
+    if vlm_result is not None and vlm_result.abrupt_jumps and flow_result.pair_metrics:
+        worst = max(flow_result.pair_metrics, key=lambda pair: pair.mean_magnitude)
+        if worst.to_step > 0:
+            scores[worst.to_step] = scores.get(worst.to_step, 0.0) + 1.5
+
+    if not scores and flow_result.pair_metrics:
+        magnitudes = [pair.mean_magnitude for pair in flow_result.pair_metrics]
+        median_mag = float(np.median(magnitudes))
+        for pair in flow_result.pair_metrics:
+            if pair.to_step <= 0:
+                continue
+            if median_mag > 0.5 and pair.mean_magnitude > 2.0 * median_mag:
+                scores[pair.to_step] = scores.get(pair.to_step, 0.0) + 1.0
+
+    return sorted(scores.keys(), key=lambda step: (-scores[step], step))
+
+
 def vlm_verify_trajectory(
     trajectory: list[Image.Image],
     target_img: Image.Image,
@@ -1952,6 +1997,7 @@ def verify_trajectory(
     flow_threshold: float,
     skip_trajectory_vlm: bool,
     max_flow_magnitude_ratio: float,
+    verify_results: Optional[list[VerifyResult]] = None,
 ) -> TrajectoryVerifyResult:
     log("[trajectory] Computing adjacent-pair optical flow metrics...")
     pair_metrics = compute_adjacent_flow_metrics(flow_estimator, trajectory, flow_threshold)
@@ -2021,11 +2067,20 @@ def verify_trajectory(
     else:
         log(f"[trajectory] Trajectory verify FAILED: {'; '.join(failure_reasons)}")
 
+    suspect_steps = identify_suspect_steps(
+        flow_result,
+        verify_results=verify_results or [],
+        vlm_result=vlm_result,
+    )
+    if suspect_steps:
+        log(f"[trajectory] Suspect steps (1-based): {suspect_steps}")
+
     return TrajectoryVerifyResult(
         flow=flow_result,
         vlm=vlm_result,
         overall_ok=overall_ok,
         failure_reason=("; ".join(failure_reasons) if failure_reasons else None),
+        suspect_steps=suspect_steps,
     )
 
 
@@ -2234,6 +2289,84 @@ def verify_edit(
     )
 
 
+def execute_one_step(
+    step_idx: int,
+    current_step: SubInstruction,
+    before: Image.Image,
+    target_img: Image.Image,
+    editor: MotionNFTEditor,
+    flow_estimator: UniMatchFlowEstimator,
+    identity_scorer: DINOv2IdentityScorer,
+    planner_vlm: Optional[QwenVLMClient],
+    max_retries: int,
+    flow_threshold: float,
+    skip_vlm_verify: bool,
+    output_dir: Path,
+    shared_parts: list[str],
+    attempt_prefix: str = "",
+) -> tuple[Image.Image, SubInstruction, VerifyResult]:
+    retry_count = 0
+    edited: Optional[Image.Image] = None
+    verify: Optional[VerifyResult] = None
+
+    while retry_count <= max_retries:
+        log(
+            f"\n[step {step_idx} | retry {retry_count}/{max_retries}] "
+            f"[{current_step.transform_type}] {current_step.instruction}"
+        )
+        t_edit = time.time()
+        log("  editing with MotionNFT...")
+        edited = editor.edit(
+            source_img=before,
+            instruction=current_step.instruction,
+            step_seed=step_idx * 100 + retry_count,
+        )
+        log(f"  edit done in {time.time() - t_edit:.1f}s")
+        retry_name = f"step_{step_idx:02d}{attempt_prefix}_retry_{retry_count}.png"
+        save_image(edited, output_dir / retry_name)
+
+        log("  verifying edit...")
+        t_verify = time.time()
+        verify = verify_edit(
+            before=before,
+            after=edited,
+            target_img=target_img,
+            step=current_step,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            planner_vlm=planner_vlm,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            shared_parts=shared_parts,
+        )
+        log(f"  verify done in {time.time() - t_verify:.1f}s")
+
+        if verify.overall_ok:
+            log(f"[step {step_idx}] PASSED")
+            break
+
+        log(f"[step {step_idx}] FAILED: {verify.failure_reason}")
+        if retry_count >= max_retries:
+            log(f"[step {step_idx}] max retries reached; keeping last attempt")
+            break
+        if planner_vlm is None:
+            raise ValueError("Replanning requires planner_vlm.")
+        current_step = replan(
+            before=before,
+            failed_after=edited,
+            target_img=target_img,
+            failed_step=current_step,
+            failure_reason=verify.failure_reason or "unknown failure",
+            planner_vlm=planner_vlm,
+            shared_parts=shared_parts,
+        )
+        retry_count += 1
+
+    if edited is None or verify is None:
+        raise RuntimeError(f"Step {step_idx} did not produce an edited image.")
+    return edited, current_step, verify
+
+
 def execute_progressive(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -2260,75 +2393,206 @@ def execute_progressive(
 
     for step_idx, step in enumerate(step_bar, start=1):
         step_bar.set_postfix(step=f"{step_idx}/{len(steps)}", type=step.transform_type)
-        retry_count = 0
-        current_step = step
         before = trajectory[-1]
-        edited: Optional[Image.Image] = None
-        verify: Optional[VerifyResult] = None
-
-        while retry_count <= max_retries:
-            log(
-                f"\n[step {step_idx}/{len(steps)} | retry {retry_count}/{max_retries}] "
-                f"[{current_step.transform_type}] {current_step.instruction}"
-            )
-            t_edit = time.time()
-            log("  editing with MotionNFT...")
-            edited = editor.edit(
-                source_img=before,
-                instruction=current_step.instruction,
-                step_seed=step_idx * 100 + retry_count,
-            )
-            log(f"  edit done in {time.time() - t_edit:.1f}s")
-            retry_path = output_dir / f"step_{step_idx:02d}_retry_{retry_count}.png"
-            save_image(edited, retry_path)
-
-            log("  verifying edit...")
-            t_verify = time.time()
-            verify = verify_edit(
-                before=before,
-                after=edited,
-                target_img=target_img,
-                step=current_step,
-                flow_estimator=flow_estimator,
-                identity_scorer=identity_scorer,
-                planner_vlm=planner_vlm,
-                flow_threshold=flow_threshold,
-                skip_vlm_verify=skip_vlm_verify,
-                shared_parts=shared_parts,
-            )
-            log(f"  verify done in {time.time() - t_verify:.1f}s")
-
-            if verify.overall_ok:
-                log(f"[step {step_idx}] PASSED")
-                break
-
-            log(f"[step {step_idx}] FAILED: {verify.failure_reason}")
-            if retry_count >= max_retries:
-                log(f"[step {step_idx}] max retries reached; keeping last attempt")
-                break
-            if planner_vlm is None:
-                raise ValueError("Replanning requires planner_vlm.")
-            current_step = replan(
-                before=before,
-                failed_after=edited,
-                target_img=target_img,
-                failed_step=current_step,
-                failure_reason=verify.failure_reason or "unknown failure",
-                planner_vlm=planner_vlm,
-                shared_parts=shared_parts,
-            )
-            retry_count += 1
-
-        if edited is None or verify is None:
-            raise RuntimeError(f"Step {step_idx} did not produce an edited image.")
+        edited, current_step, verify = execute_one_step(
+            step_idx=step_idx,
+            current_step=step,
+            before=before,
+            target_img=target_img,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            planner_vlm=planner_vlm,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            output_dir=output_dir,
+            shared_parts=shared_parts,
+        )
         trajectory.append(edited)
         final_steps.append(current_step)
         verify_results.append(verify)
-        step_path = output_dir / f"step_{step_idx:02d}.png"
-        save_image(edited, step_path)
+        save_image(edited, output_dir / f"step_{step_idx:02d}.png")
 
     log(f"[execute] Finished all {len(steps)} steps")
     return trajectory, final_steps, verify_results
+
+
+def re_execute_steps_from(
+    start_step: int,
+    trajectory: list[Image.Image],
+    final_steps: list[SubInstruction],
+    verify_results: list[VerifyResult],
+    target_img: Image.Image,
+    editor: MotionNFTEditor,
+    flow_estimator: UniMatchFlowEstimator,
+    identity_scorer: DINOv2IdentityScorer,
+    planner_vlm: Optional[QwenVLMClient],
+    max_retries: int,
+    flow_threshold: float,
+    skip_vlm_verify: bool,
+    output_dir: Path,
+    shared_parts: list[str],
+    attempt_prefix: str,
+) -> tuple[list[Image.Image], list[SubInstruction], list[VerifyResult]]:
+    if start_step < 1 or start_step > len(final_steps):
+        raise ValueError(f"start_step must be in [1, {len(final_steps)}], got {start_step}")
+
+    updated_trajectory = trajectory[:start_step]
+    updated_steps = list(final_steps)
+    updated_verify = list(verify_results)
+
+    for step_idx in range(start_step, len(final_steps) + 1):
+        before = updated_trajectory[-1]
+        edited, current_step, verify = execute_one_step(
+            step_idx=step_idx,
+            current_step=updated_steps[step_idx - 1],
+            before=before,
+            target_img=target_img,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            planner_vlm=planner_vlm,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            output_dir=output_dir,
+            shared_parts=shared_parts,
+            attempt_prefix=attempt_prefix,
+        )
+        updated_trajectory.append(edited)
+        updated_steps[step_idx - 1] = current_step
+        updated_verify[step_idx - 1] = verify
+        save_image(edited, output_dir / f"step_{step_idx:02d}.png")
+
+    return updated_trajectory, updated_steps, updated_verify
+
+
+def repair_trajectory(
+    trajectory: list[Image.Image],
+    final_steps: list[SubInstruction],
+    verify_results: list[VerifyResult],
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    editor: MotionNFTEditor,
+    flow_estimator: UniMatchFlowEstimator,
+    identity_scorer: DINOv2IdentityScorer,
+    output_dir: Path,
+    shared_parts: list[str],
+    max_retries: int,
+    flow_threshold: float,
+    skip_vlm_verify: bool,
+    skip_trajectory_vlm: bool,
+    trajectory_flow_ratio: float,
+    max_trajectory_repairs: int,
+) -> tuple[
+    list[Image.Image],
+    list[SubInstruction],
+    list[VerifyResult],
+    TrajectoryVerifyResult,
+    list[dict[str, Any]],
+]:
+    log("\n========== Phase 1.6: Trajectory Repair ==========")
+    repair_log: list[dict[str, Any]] = []
+    current_trajectory = list(trajectory)
+    current_steps = list(final_steps)
+    current_verify = list(verify_results)
+
+    trajectory_verify = verify_trajectory(
+        trajectory=current_trajectory,
+        target_img=target_img,
+        flow_estimator=flow_estimator,
+        planner_vlm=planner_vlm,
+        shared_parts=shared_parts,
+        flow_threshold=flow_threshold,
+        skip_trajectory_vlm=skip_trajectory_vlm,
+        max_flow_magnitude_ratio=trajectory_flow_ratio,
+        verify_results=current_verify,
+    )
+
+    for round_idx in range(max_trajectory_repairs):
+        if trajectory_verify.overall_ok:
+            log("[trajectory-repair] Trajectory already OK; no repair needed.")
+            break
+
+        suspect_steps = trajectory_verify.suspect_steps
+        if not suspect_steps:
+            log("[trajectory-repair] No suspect steps identified; stopping repair.")
+            break
+
+        start_step = min(suspect_steps)
+        attempt_prefix = f"_repair{round_idx + 1}"
+        failure_reason = trajectory_verify.failure_reason or "Trajectory continuity failed"
+        log(
+            f"[trajectory-repair] Round {round_idx + 1}/{max_trajectory_repairs}: "
+            f"re-executing from step {start_step} (suspects={suspect_steps})"
+        )
+
+        if planner_vlm is not None and start_step <= len(current_trajectory) - 1:
+            repaired_step = replan(
+                before=current_trajectory[start_step - 1],
+                failed_after=current_trajectory[start_step],
+                target_img=target_img,
+                failed_step=current_steps[start_step - 1],
+                failure_reason=(
+                    f"Trajectory repair round {round_idx + 1}: {failure_reason}. "
+                    f"Focus on smoothing the transition into step_{start_step:02d}."
+                ),
+                planner_vlm=planner_vlm,
+                shared_parts=shared_parts,
+            )
+            current_steps[start_step - 1] = repaired_step
+
+        current_trajectory, current_steps, current_verify = re_execute_steps_from(
+            start_step=start_step,
+            trajectory=current_trajectory,
+            final_steps=current_steps,
+            verify_results=current_verify,
+            target_img=target_img,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            planner_vlm=planner_vlm,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            output_dir=output_dir,
+            shared_parts=shared_parts,
+            attempt_prefix=attempt_prefix,
+        )
+
+        trajectory_verify = verify_trajectory(
+            trajectory=current_trajectory,
+            target_img=target_img,
+            flow_estimator=flow_estimator,
+            planner_vlm=planner_vlm,
+            shared_parts=shared_parts,
+            flow_threshold=flow_threshold,
+            skip_trajectory_vlm=skip_trajectory_vlm,
+            max_flow_magnitude_ratio=trajectory_flow_ratio,
+            verify_results=current_verify,
+        )
+
+        round_record = {
+            "round": round_idx + 1,
+            "start_step": start_step,
+            "suspect_steps": suspect_steps,
+            "overall_ok_after": trajectory_verify.overall_ok,
+            "failure_reason_after": trajectory_verify.failure_reason,
+        }
+        repair_log.append(round_record)
+        log(
+            f"[trajectory-repair] Round {round_idx + 1} done | "
+            f"overall_ok={trajectory_verify.overall_ok}"
+        )
+        if trajectory_verify.overall_ok:
+            break
+
+    repair_path = output_dir / "trajectory_repair.json"
+    repair_path.write_text(json.dumps(repair_log, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"[trajectory-repair] Wrote {repair_path}")
+
+    return current_trajectory, current_steps, current_verify, trajectory_verify, repair_log
 
 
 def progressive_pose_edit(
@@ -2346,6 +2610,8 @@ def progressive_pose_edit(
     skip_trajectory_vlm: bool = False,
     trajectory_flow_ratio: float = 4.0,
     pre_alignment: Optional[PreAlignDecision] = None,
+    skip_trajectory_repair: bool = False,
+    max_trajectory_repairs: int = 2,
 ) -> PipelineResult:
     log("\n========== Phase 0: Planning ==========")
     analysis, steps, raw_plan = plan(
@@ -2381,7 +2647,38 @@ def progressive_pose_edit(
         flow_threshold=flow_threshold,
         skip_trajectory_vlm=skip_trajectory_vlm,
         max_flow_magnitude_ratio=trajectory_flow_ratio,
+        verify_results=verify_results,
     )
+
+    trajectory_repair: Optional[list[dict[str, Any]]] = None
+    if not skip_trajectory_repair and max_trajectory_repairs > 0 and not trajectory_verify.overall_ok:
+        (
+            trajectory,
+            final_steps,
+            verify_results,
+            trajectory_verify,
+            trajectory_repair,
+        ) = repair_trajectory(
+            trajectory=trajectory,
+            final_steps=final_steps,
+            verify_results=verify_results,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            shared_parts=analysis.shared_parts,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            skip_trajectory_vlm=skip_trajectory_vlm,
+            trajectory_flow_ratio=trajectory_flow_ratio,
+            max_trajectory_repairs=max_trajectory_repairs,
+        )
+    elif skip_trajectory_repair:
+        log("[trajectory-repair] Skipped (--skip_trajectory_repair)")
+
     trajectory_verify_path = output_dir / "trajectory_verify.json"
     trajectory_verify_path.write_text(
         json.dumps(trajectory_verify_to_dict(trajectory_verify), indent=2, ensure_ascii=False),
@@ -2398,6 +2695,7 @@ def progressive_pose_edit(
         final_img=trajectory[-1],
         pre_alignment=pre_alignment,
         trajectory_verify=trajectory_verify,
+        trajectory_repair=trajectory_repair,
     )
 
 
@@ -2502,6 +2800,17 @@ def parse_args() -> argparse.Namespace:
         help="Max allowed adjacent-pair flow magnitude ratio for trajectory continuity.",
     )
     parser.add_argument(
+        "--max_trajectory_repairs",
+        type=int,
+        default=2,
+        help="After trajectory verify fails, re-execute suspect steps up to this many rounds.",
+    )
+    parser.add_argument(
+        "--skip_trajectory_repair",
+        action="store_true",
+        help="Disable Phase 1.6 cascade re-edit of suspect trajectory steps.",
+    )
+    parser.add_argument(
         "--skip_pre_align",
         action="store_true",
         help="Disable VLM-guided deterministic flip/rotate before planning.",
@@ -2537,6 +2846,7 @@ def trajectory_verify_to_dict(result: Optional[TrajectoryVerifyResult]) -> Optio
             "issues": result.flow.issues,
             "pair_metrics": [asdict(pair) for pair in result.flow.pair_metrics],
         },
+        "suspect_steps": result.suspect_steps,
         "vlm": asdict(result.vlm) if result.vlm is not None else None,
     }
 
@@ -2548,6 +2858,7 @@ def serializable_result(result: PipelineResult) -> dict[str, Any]:
         "instructions": [asdict(step) for step in result.instructions],
         "verify_results": [asdict(verify) for verify in result.verify_results],
         "trajectory_verify": trajectory_verify_to_dict(result.trajectory_verify),
+        "trajectory_repair": result.trajectory_repair,
         "final_image": "final.png",
         "trajectory": [f"step_{idx:02d}.png" for idx in range(len(result.trajectory))],
     }
@@ -2667,6 +2978,8 @@ def main() -> None:
         skip_trajectory_vlm=args.skip_trajectory_vlm,
         trajectory_flow_ratio=args.trajectory_flow_ratio,
         pre_alignment=pre_alignment,
+        skip_trajectory_repair=args.skip_trajectory_repair,
+        max_trajectory_repairs=args.max_trajectory_repairs,
     )
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
 
@@ -2682,6 +2995,7 @@ def main() -> None:
     log("  step_00.png .. step_NN.png  — editing trajectory")
     log("  plan.json                   — VLM editing plan")
     log("  trajectory_verify.json      — flow + VLM trajectory continuity")
+    log("  trajectory_repair.json      — suspect-step cascade repair log (if run)")
     log("  final.png                   — final result")
     log("  result.json                 — analysis + verify summary")
 

@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 
 GPU_IDS="${GPU_IDS:-0}"
-DATASET_ROOT="${DATASET_ROOT:-/mnt/sy/dataset/SPair-71k}"
+DATASET_ROOT="${DATASET_ROOT:-/data/shared-vilab/datasets/spair-71k/SPair-71k}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit}"
 # Processed in fixed order: test -> val -> trn (train), regardless of list order here.
 SPLITS="${SPLITS:-test,val,trn}"
