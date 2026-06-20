@@ -214,6 +214,15 @@ A1. OBJECT CLASSIFICATION
   For CROSS-CATEGORY pairs (cat→dog, wooden chair→metal chair), identify
   ANALOGOUS PARTS across the two objects for mapping.
 
+A1b. SHARED PARTS (critical — fill before planning steps)
+  List every object part that is clearly visible on BOTH source AND target.
+  These are the "intersection" parts — analogous structures present in both images
+  (e.g. head, tail, four legs, ears for animals; wheels, headlights, windshield for cars).
+  Cross-category: use analogous names (cat head ↔ dog head counts as shared).
+  Parts visible on only one image must NOT be listed.
+  Every shared part must remain clearly visible in the edited object after EVERY step.
+  Do not plan edits that remove, erase, occlude, or crop out any shared part.
+
 A2. TRANSFORM GAP ANALYSIS — assess each axis:
   First pick a TWO-landmark axis on source and target
   (head->tail, front->rear, tip->base) and note where each landmark sits in the frame
@@ -286,6 +295,7 @@ INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
 
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
+  - ALL shared_parts must remain clearly visible after this step (never remove or hide them)
   - Prefer preserving background, lighting, and shadows, but do not sacrifice source identity for them
   - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
   - Do NOT plan coarse whole-object rotation unless fixing a small residual tilt
@@ -311,7 +321,15 @@ OUTPUT JSON SCHEMA
       "deformability": "rigid | articulated | deformable"
     }},
     "part_mapping": [
-      {{"source_part": "...", "target_part": "...", "analogous": true}}
+      {{"source_part": "...", "target_part": "...", "analogous": true, "visible_on_both": true}}
+    ],
+    "shared_parts": [
+      {{
+        "part_name": "head",
+        "source_label": "head",
+        "target_label": "head",
+        "must_remain_visible": true
+      }}
     ],
     "transform_gaps": {{
       "viewpoint": {{
@@ -364,22 +382,39 @@ geometry/configuration.
 This step's instruction: "{instruction}"
 Transform type: {transform_type}
 Expected change: {expected_change}
-
+{shared_parts_block}
 Answer Yes or No for each:
 1. Was the instructed geometric change applied? (viewpoint/scale/pose as specified)
 2. Is the source object's identity preserved? (same category, texture, color, material)
 3. Is the background broadly acceptable? (not a strict pass/fail criterion)
 4. Is the change physically/geometrically plausible?
 5. Are there no visual artifacts?
-6. After this edit, is the source object's configuration CLOSER to the TARGET than before?
-
+6. After this edit, is the SOURCE object's pose, size, and rotation/orientation
+   closer to the TARGET's pose, size, and rotation (geometry only — not identity)?
+{shared_parts_question}
 Format:
 1. Yes/No
 2. Yes/No
 3. Yes/No
 4. Yes/No
 5. Yes/No
-6. Yes/No"""
+6. Yes/No
+{shared_parts_format}"""
+
+VERIFY_SHARED_PARTS_BLOCK = """
+Shared parts that must remain clearly visible on the edited object (present on BOTH
+source and target geometry). None of these may disappear or become unrecognizable:
+{shared_parts_list}
+"""
+
+VERIFY_SHARED_PARTS_QUESTION = (
+    "7. Are ALL of the listed shared parts still clearly visible and recognizable "
+    "on the edited object in IMAGE 2?"
+)
+
+VERIFY_NO_SHARED_PARTS_BLOCK = ""
+VERIFY_NO_SHARED_PARTS_QUESTION = ""
+VERIFY_NO_SHARED_PARTS_FORMAT = ""
 
 REPLAN_SYSTEM = """You are a motion editing planner.
 A previous editing step failed verification.
@@ -401,11 +436,13 @@ Transform type: {transform_type}
 Expected change: {expected_change}
 Identity warning: {identity_warning}
 Failure reason: {failure_reason}
+Shared parts that must stay visible: {shared_parts_list}
 
 Write the corrected instruction as a natural edit prompt, e.g.:
   "Have the cat turn its head and body slightly toward the left."
   "Make the cat lower its front paws while keeping its hind legs in place."
 Do NOT use degree numbers or percentages.
+All shared parts listed above must remain clearly visible in the corrected edit.
 
 Analyze why it failed and provide a CORRECTED instruction:
 {{
@@ -417,6 +454,45 @@ Analyze why it failed and provide a CORRECTED instruction:
   "cumulative_progress": ...,
   "identity_warning": "none | check_texture | check_silhouette"
 }}"""
+
+
+TRAJECTORY_VERIFY_SYSTEM = """You are a trajectory quality verifier for sparse keyframe editing.
+
+You will see an ordered sequence of edited SOURCE images (starting from a pre-aligned
+source) plus a TARGET image at the end as a geometry reference only.
+
+CRITICAL:
+  - The edited object must keep the SOURCE identity (category, texture, color, material)
+    throughout every keyframe. Never expect it to look like the TARGET object.
+  - Judge only whether SOURCE geometry — pose, size, rotation/orientation, and analogous
+    part layout — progressively moves toward the TARGET's pose, size, and rotation.
+
+These are sparse intermediate keyframes (not a dense video). Small jumps between
+consecutive keyframes are OK. Flag sudden geometry reversals or part disappearances."""
+
+TRAJECTORY_VERIFY_USER = """Ordered SOURCE editing trajectory:
+{step_image_notes}
+Final image = TARGET (geometry reference ONLY for pose, size, rotation — NOT identity).
+
+The object in every step must remain the SOURCE object. Do not penalize the sequence
+for failing to match TARGET identity, texture, color, or category.
+
+Shared SOURCE parts (also present on TARGET geometry) that must stay visible:
+{shared_parts_list}
+
+Answer Yes or No for each:
+1. Does the SOURCE object progressively change its pose, size, and rotation/orientation
+   toward the TARGET's pose, size, and rotation across the sequence?
+   (Geometry only. SOURCE identity must stay the same. Sparse keyframe jumps are OK.)
+2. Are there abrupt non-progressive geometry jumps or reversals in pose/size/rotation
+   between any consecutive steps?
+3. Are ALL listed shared parts still clearly visible and recognizable on the SOURCE
+   object across the sequence?
+
+Format:
+1. Yes/No
+2. Yes/No
+3. Yes/No"""
 
 
 # ============================================================
@@ -461,6 +537,7 @@ class Analysis:
     target_description: str
     target_deformability: str
     part_mapping: list[dict[str, Any]]
+    shared_parts: list[str]
     viewpoint_azimuth: str
     viewpoint_elevation: str
     inplane_rotation: str
@@ -479,6 +556,7 @@ class VLMVerifyResult:
     physically_plausible: bool
     no_artifacts: bool
     closer_to_target: bool
+    shared_parts_visible: bool = True
 
 
 @dataclass
@@ -490,6 +568,37 @@ class VerifyResult:
     silhouette_ok: bool
     semantic_ok: bool
     background_ok: bool
+    shared_parts_ok: bool
+    overall_ok: bool
+    failure_reason: Optional[str] = None
+
+
+@dataclass
+class AdjacentFlowMetrics:
+    from_step: int
+    to_step: int
+    mean_magnitude: float
+    direction: tuple[float, float]
+
+
+@dataclass
+class TrajectoryFlowVerifyResult:
+    pair_metrics: list[AdjacentFlowMetrics]
+    smooth_ok: bool
+    issues: list[str]
+
+
+@dataclass
+class TrajectoryVLMVerifyResult:
+    progressive_toward_target: bool
+    abrupt_jumps: bool
+    shared_parts_visible: bool
+
+
+@dataclass
+class TrajectoryVerifyResult:
+    flow: TrajectoryFlowVerifyResult
+    vlm: Optional[TrajectoryVLMVerifyResult]
     overall_ok: bool
     failure_reason: Optional[str] = None
 
@@ -504,6 +613,7 @@ class PipelineResult:
     verify_results: list[VerifyResult]
     final_img: Image.Image
     pre_alignment: Optional[PreAlignDecision] = None
+    trajectory_verify: Optional[TrajectoryVerifyResult] = None
 
 
 # ============================================================
@@ -525,17 +635,81 @@ def parse_json(text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-def parse_yes_no(text: str) -> dict[int, bool]:
+def parse_yes_no(text: str, num_questions: int = 6) -> dict[int, bool]:
     answers: dict[int, bool] = {}
     for line in text.splitlines():
         match = re.match(r"\s*(\d+)\s*[\.\):\-]\s*(yes|no)\b", line, re.IGNORECASE)
         if match:
             answers[int(match.group(1))] = match.group(2).lower() == "yes"
-    if len(answers) < 6:
+    if len(answers) < num_questions:
         tokens = re.findall(r"\b(yes|no)\b", text, flags=re.IGNORECASE)
-        for idx, token in enumerate(tokens[:6], start=1):
+        for idx, token in enumerate(tokens[:num_questions], start=1):
             answers.setdefault(idx, token.lower() == "yes")
     return answers
+
+
+def extract_shared_parts(analysis_dict: dict[str, Any]) -> list[str]:
+    """Parts visible on both source and target that must stay visible during editing."""
+    raw = analysis_dict.get("shared_parts") or []
+    names: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            label = (
+                item.get("part_name")
+                or item.get("name")
+                or item.get("source_label")
+                or item.get("target_label")
+            )
+            if label and item.get("must_remain_visible", True):
+                names.append(str(label).strip())
+        elif item:
+            names.append(str(item).strip())
+
+    if names:
+        return names
+
+    for mapping in analysis_dict.get("part_mapping") or []:
+        if not mapping.get("analogous", False):
+            continue
+        if mapping.get("visible_on_both") is False:
+            continue
+        label = mapping.get("source_part") or mapping.get("target_part")
+        if label:
+            names.append(str(label).strip())
+    return names
+
+
+def format_shared_parts_list(shared_parts: list[str]) -> str:
+    if not shared_parts:
+        return "(none identified)"
+    return ", ".join(shared_parts)
+
+
+def build_verify_prompt(
+    instruction: str,
+    transform_type: str,
+    expected_change: str,
+    shared_parts: list[str],
+) -> str:
+    if shared_parts:
+        shared_parts_block = VERIFY_SHARED_PARTS_BLOCK.format(
+            shared_parts_list=format_shared_parts_list(shared_parts),
+        )
+        shared_parts_question = VERIFY_SHARED_PARTS_QUESTION
+        shared_parts_format = "7. Yes/No"
+    else:
+        shared_parts_block = VERIFY_NO_SHARED_PARTS_BLOCK
+        shared_parts_question = VERIFY_NO_SHARED_PARTS_QUESTION
+        shared_parts_format = VERIFY_NO_SHARED_PARTS_FORMAT
+
+    return VERIFY_USER.format(
+        instruction=instruction,
+        transform_type=transform_type,
+        expected_change=expected_change,
+        shared_parts_block=shared_parts_block,
+        shared_parts_question=shared_parts_question,
+        shared_parts_format=shared_parts_format,
+    )
 
 
 def build_analysis(parsed: dict[str, Any]) -> Analysis:
@@ -544,12 +718,14 @@ def build_analysis(parsed: dict[str, Any]) -> Analysis:
     target = analysis.get("target_object", {})
     gaps = analysis.get("transform_gaps", {})
     viewpoint = gaps.get("viewpoint", {})
+    shared_parts = extract_shared_parts(analysis)
     return Analysis(
         source_description=source.get("description", ""),
         source_deformability=source.get("deformability", ""),
         target_description=target.get("description", ""),
         target_deformability=target.get("deformability", ""),
         part_mapping=analysis.get("part_mapping", []),
+        shared_parts=shared_parts,
         viewpoint_azimuth=viewpoint.get("azimuth", ""),
         viewpoint_elevation=viewpoint.get("elevation", ""),
         inplane_rotation=viewpoint.get("inplane_rotation", ""),
@@ -1419,6 +1595,10 @@ def plan(
     tgt_desc = (analysis.target_description or "unknown")[:80]
     log(f"[plan] Done in {elapsed:.1f}s — source: {src_desc}")
     log(f"[plan] Target geometry ref: {tgt_desc}")
+    if analysis.shared_parts:
+        log(f"[plan] Shared parts (must stay visible): {format_shared_parts_list(analysis.shared_parts)}")
+    else:
+        log("[plan] Shared parts: none identified by planner")
     for step in steps:
         log(
             f"  step {step.step}/{n_steps} [{step.transform_type}] "
@@ -1438,7 +1618,10 @@ def vlm_verify(
     target_img: Image.Image,
     step: SubInstruction,
     planner_vlm: QwenVLMClient,
+    shared_parts: Optional[list[str]] = None,
 ) -> VLMVerifyResult:
+    shared_parts = shared_parts or []
+    num_questions = 7 if shared_parts else 6
     messages = [
         {"role": "system", "content": [{"type": "text", "text": VERIFY_SYSTEM}]},
         {
@@ -1452,16 +1635,18 @@ def vlm_verify(
                 {"type": "text", "text": "(IMAGE 3 = TARGET)"},
                 {
                     "type": "text",
-                    "text": VERIFY_USER.format(
+                    "text": build_verify_prompt(
                         instruction=step.instruction,
                         transform_type=step.transform_type,
                         expected_change=step.expected_change,
+                        shared_parts=shared_parts,
                     ),
                 },
             ],
         },
     ]
-    answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128))
+    answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128), num_questions=num_questions)
+    shared_parts_visible = answers.get(7, True) if shared_parts else True
     return VLMVerifyResult(
         geometric_change_applied=answers.get(1, False),
         identity_preserved=answers.get(2, False),
@@ -1469,6 +1654,7 @@ def vlm_verify(
         physically_plausible=answers.get(4, False),
         no_artifacts=answers.get(5, False),
         closer_to_target=answers.get(6, False),
+        shared_parts_visible=shared_parts_visible,
     )
 
 
@@ -1479,6 +1665,7 @@ def replan(
     failed_step: SubInstruction,
     failure_reason: str,
     planner_vlm: QwenVLMClient,
+    shared_parts: Optional[list[str]] = None,
 ) -> SubInstruction:
     log(f"[replan] Asking VLM to revise step {failed_step.step} after failure: {failure_reason}")
     t0 = time.time()
@@ -1501,6 +1688,7 @@ def replan(
                         expected_change=failed_step.expected_change,
                         identity_warning=failed_step.identity_warning,
                         failure_reason=failure_reason,
+                        shared_parts_list=format_shared_parts_list(shared_parts or []),
                     ),
                 },
             ],
@@ -1622,6 +1810,225 @@ def check_silhouette_direction(
     return True
 
 
+def _flow_pair_stats(flow: np.ndarray, flow_threshold: float) -> tuple[float, tuple[float, float]]:
+    mag = flow_magnitude(flow)
+    motion_mask = mag > flow_threshold
+    if not motion_mask.any():
+        motion_mask = np.ones(mag.shape, dtype=bool)
+    roi_flow = flow[motion_mask]
+    mean_vec = roi_flow.mean(axis=0).astype(np.float32)
+    mean_mag = float(np.linalg.norm(roi_flow, axis=-1).mean())
+    norm = float(np.linalg.norm(mean_vec))
+    if norm < 1e-6:
+        direction = (0.0, 0.0)
+    else:
+        direction = (float(mean_vec[0] / norm), float(mean_vec[1] / norm))
+    return mean_mag, direction
+
+
+def compute_adjacent_flow_metrics(
+    flow_estimator: UniMatchFlowEstimator,
+    trajectory: list[Image.Image],
+    flow_threshold: float,
+) -> list[AdjacentFlowMetrics]:
+    pairs: list[AdjacentFlowMetrics] = []
+    for idx in range(len(trajectory) - 1):
+        flow = flow_estimator.estimate(trajectory[idx], trajectory[idx + 1])
+        mean_mag, direction = _flow_pair_stats(flow, flow_threshold)
+        pairs.append(
+            AdjacentFlowMetrics(
+                from_step=idx,
+                to_step=idx + 1,
+                mean_magnitude=mean_mag,
+                direction=direction,
+            )
+        )
+    return pairs
+
+
+def verify_trajectory_flow(
+    pair_metrics: list[AdjacentFlowMetrics],
+    max_magnitude_ratio: float = 4.0,
+    direction_flip_cosine: float = -0.15,
+) -> TrajectoryFlowVerifyResult:
+    issues: list[str] = []
+    if len(pair_metrics) < 2:
+        return TrajectoryFlowVerifyResult(
+            pair_metrics=pair_metrics,
+            smooth_ok=True,
+            issues=issues,
+        )
+
+    magnitudes = [pair.mean_magnitude for pair in pair_metrics]
+    median_mag = float(np.median(magnitudes))
+
+    for pair in pair_metrics:
+        if median_mag > 0.5 and pair.mean_magnitude > max_magnitude_ratio * median_mag:
+            issues.append(
+                f"Flow outlier at step {pair.from_step:02d}->{pair.to_step:02d}: "
+                f"magnitude={pair.mean_magnitude:.2f} vs median={median_mag:.2f}"
+            )
+
+    for idx in range(len(pair_metrics) - 1):
+        left = pair_metrics[idx]
+        right = pair_metrics[idx + 1]
+        if left.mean_magnitude > 1e-3 and right.mean_magnitude > 1e-3:
+            ratio = max(left.mean_magnitude, right.mean_magnitude) / min(
+                left.mean_magnitude, right.mean_magnitude
+            )
+            if ratio > max_magnitude_ratio:
+                issues.append(
+                    f"Flow magnitude jump between step {left.from_step:02d}->{left.to_step:02d} "
+                    f"and {right.from_step:02d}->{right.to_step:02d}: ratio={ratio:.2f}"
+                )
+
+        if left.direction != (0.0, 0.0) and right.direction != (0.0, 0.0):
+            cos = cosine_similarity_np(
+                np.asarray(left.direction, dtype=np.float32),
+                np.asarray(right.direction, dtype=np.float32),
+            )
+            if cos < direction_flip_cosine:
+                issues.append(
+                    f"Flow direction flip between step {left.to_step:02d} and "
+                    f"{right.to_step:02d}: cosine={cos:.2f}"
+                )
+
+    return TrajectoryFlowVerifyResult(
+        pair_metrics=pair_metrics,
+        smooth_ok=len(issues) == 0,
+        issues=issues,
+    )
+
+
+def vlm_verify_trajectory(
+    trajectory: list[Image.Image],
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    shared_parts: list[str],
+) -> TrajectoryVLMVerifyResult:
+    content: list[dict[str, Any]] = []
+    step_notes: list[str] = []
+    for idx, image in enumerate(trajectory):
+        content.append({"type": "image", "image": image})
+        content.append({"type": "text", "text": f"(IMAGE {idx + 1} = step_{idx:02d})"})
+        step_notes.append(f"  IMAGE {idx + 1} = step_{idx:02d}")
+
+    content.append({"type": "image", "image": target_img})
+    content.append(
+        {
+            "type": "text",
+            "text": f"(IMAGE {len(trajectory) + 1} = TARGET geometry reference)",
+        }
+    )
+    content.append(
+        {
+            "type": "text",
+            "text": TRAJECTORY_VERIFY_USER.format(
+                step_image_notes="\n".join(step_notes),
+                shared_parts_list=format_shared_parts_list(shared_parts),
+            ),
+        }
+    )
+
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": TRAJECTORY_VERIFY_SYSTEM}]},
+        {"role": "user", "content": content},
+    ]
+    answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128), num_questions=3)
+    shared_parts_visible = answers.get(3, True) if shared_parts else True
+    return TrajectoryVLMVerifyResult(
+        progressive_toward_target=answers.get(1, False),
+        abrupt_jumps=answers.get(2, False),
+        shared_parts_visible=shared_parts_visible,
+    )
+
+
+def verify_trajectory(
+    trajectory: list[Image.Image],
+    target_img: Image.Image,
+    flow_estimator: UniMatchFlowEstimator,
+    planner_vlm: Optional[QwenVLMClient],
+    shared_parts: list[str],
+    flow_threshold: float,
+    skip_trajectory_vlm: bool,
+    max_flow_magnitude_ratio: float,
+) -> TrajectoryVerifyResult:
+    log("[trajectory] Computing adjacent-pair optical flow metrics...")
+    pair_metrics = compute_adjacent_flow_metrics(flow_estimator, trajectory, flow_threshold)
+    for pair in pair_metrics:
+        log(
+            f"  step {pair.from_step:02d}->{pair.to_step:02d}: "
+            f"mag={pair.mean_magnitude:.2f}, "
+            f"dir=({pair.direction[0]:+.2f}, {pair.direction[1]:+.2f})"
+        )
+
+    flow_result = verify_trajectory_flow(
+        pair_metrics,
+        max_magnitude_ratio=max_flow_magnitude_ratio,
+    )
+    if flow_result.smooth_ok:
+        log("[trajectory] Flow continuity OK")
+    else:
+        log("[trajectory] Flow continuity issues:")
+        for issue in flow_result.issues:
+            log(f"  - {issue}")
+
+    vlm_result: Optional[TrajectoryVLMVerifyResult] = None
+    vlm_ok = True
+    if skip_trajectory_vlm:
+        log("[trajectory] VLM sequence review skipped (--skip_trajectory_vlm)")
+    else:
+        if planner_vlm is None:
+            raise ValueError("planner_vlm is required for trajectory VLM verify.")
+        log("[trajectory] Running VLM multi-image sequence review...")
+        vlm_result = vlm_verify_trajectory(
+            trajectory=trajectory,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            shared_parts=shared_parts,
+        )
+        log(
+            "[trajectory] VLM: "
+            f"geometry_progressive={vlm_result.progressive_toward_target}, "
+            f"abrupt_geometry_jumps={vlm_result.abrupt_jumps}, "
+            f"shared_parts={vlm_result.shared_parts_visible}"
+        )
+        vlm_ok = (
+            vlm_result.progressive_toward_target
+            and not vlm_result.abrupt_jumps
+            and vlm_result.shared_parts_visible
+        )
+
+    overall_ok = flow_result.smooth_ok and vlm_ok
+    failure_reasons: list[str] = []
+    if not flow_result.smooth_ok:
+        failure_reasons.extend(flow_result.issues)
+    if vlm_result is not None:
+        if not vlm_result.progressive_toward_target:
+            failure_reasons.append(
+                "VLM: SOURCE geometry (pose/size/rotation) not progressively toward TARGET"
+            )
+        if vlm_result.abrupt_jumps:
+            failure_reasons.append("VLM: abrupt geometry jumps or reversals detected")
+        if not vlm_result.shared_parts_visible:
+            failure_reasons.append(
+                f"VLM: shared parts not visible throughout: "
+                f"{format_shared_parts_list(shared_parts)}"
+            )
+
+    if overall_ok:
+        log("[trajectory] Trajectory verify PASSED")
+    else:
+        log(f"[trajectory] Trajectory verify FAILED: {'; '.join(failure_reasons)}")
+
+    return TrajectoryVerifyResult(
+        flow=flow_result,
+        vlm=vlm_result,
+        overall_ok=overall_ok,
+        failure_reason=("; ".join(failure_reasons) if failure_reasons else None),
+    )
+
+
 def verify_edit(
     before: Image.Image,
     after: Image.Image,
@@ -1632,8 +2039,10 @@ def verify_edit(
     planner_vlm: Optional[QwenVLMClient],
     flow_threshold: float,
     skip_vlm_verify: bool,
+    shared_parts: Optional[list[str]] = None,
     verbose: bool = True,
 ) -> VerifyResult:
+    shared_parts = shared_parts or []
     identity_threshold = 0.80
     skip_flow_direction = False
     check_flow_radial = False
@@ -1734,6 +2143,7 @@ def verify_edit(
             silhouette_ok=silhouette_ok,
             semantic_ok=False,
             background_ok=background_ok,
+            shared_parts_ok=True,
             overall_ok=False,
             failure_reason="; ".join(objective_failures),
         )
@@ -1749,6 +2159,7 @@ def verify_edit(
             silhouette_ok=silhouette_ok,
             semantic_ok=True,
             background_ok=background_ok,
+            shared_parts_ok=True,
             overall_ok=True,
             failure_reason=None,
         )
@@ -1758,18 +2169,22 @@ def verify_edit(
 
     if verbose:
         log("    [verify] running VLM semantic checklist...")
-    vlm_result = vlm_verify(before, after, target_img, step, planner_vlm)
+    vlm_result = vlm_verify(
+        before, after, target_img, step, planner_vlm, shared_parts=shared_parts
+    )
     if verbose:
         log(
             "    [verify] VLM: "
             f"geometry={vlm_result.geometric_change_applied}, "
             f"identity={vlm_result.identity_preserved}, "
             f"background={vlm_result.background_unchanged} (non-blocking), "
+            f"shared_parts={vlm_result.shared_parts_visible}, "
             f"plausible={vlm_result.physically_plausible}, "
             f"artifacts_free={vlm_result.no_artifacts}, "
             f"closer_to_target={vlm_result.closer_to_target}"
         )
     background_ok = background_ok and vlm_result.background_unchanged
+    shared_parts_ok = vlm_result.shared_parts_visible if shared_parts else True
     overall = (
         flow_direction_ok
         and flow_magnitude_ok
@@ -1781,6 +2196,7 @@ def verify_edit(
         and vlm_result.physically_plausible
         and vlm_result.no_artifacts
         and vlm_result.closer_to_target
+        and shared_parts_ok
     )
 
     failure_reason = None
@@ -1790,12 +2206,18 @@ def verify_edit(
             reasons.append("Geometric change not applied as instructed")
         if not vlm_result.identity_preserved:
             reasons.append("VLM: identity not preserved")
+        if not shared_parts_ok:
+            reasons.append(
+                f"Shared parts no longer visible: {format_shared_parts_list(shared_parts)}"
+            )
         if not vlm_result.physically_plausible:
             reasons.append("Change not physically plausible")
         if not vlm_result.no_artifacts:
             reasons.append("Visual artifacts detected")
         if not vlm_result.closer_to_target:
-            reasons.append("Not closer to target configuration")
+            reasons.append(
+                "SOURCE geometry (pose/size/rotation) not closer to TARGET than before"
+            )
         failure_reason = "; ".join(reasons)
 
     return VerifyResult(
@@ -1806,6 +2228,7 @@ def verify_edit(
         silhouette_ok=silhouette_ok,
         semantic_ok=vlm_result.geometric_change_applied,
         background_ok=background_ok,
+        shared_parts_ok=shared_parts_ok,
         overall_ok=overall,
         failure_reason=failure_reason,
     )
@@ -1823,12 +2246,16 @@ def execute_progressive(
     flow_threshold: float,
     skip_vlm_verify: bool,
     output_dir: Path,
+    shared_parts: Optional[list[str]] = None,
 ) -> tuple[list[Image.Image], list[SubInstruction], list[VerifyResult]]:
+    shared_parts = shared_parts or []
     trajectory = [source_img]
     verify_results: list[VerifyResult] = []
     final_steps: list[SubInstruction] = []
 
     log(f"[execute] Starting progressive editing ({len(steps)} steps, max_retries={max_retries})")
+    if shared_parts:
+        log(f"[execute] Preserving shared parts: {format_shared_parts_list(shared_parts)}")
     step_bar = tqdm(steps, desc="Editing steps", unit="step", disable=not VERBOSE)
 
     for step_idx, step in enumerate(step_bar, start=1):
@@ -1867,6 +2294,7 @@ def execute_progressive(
                 planner_vlm=planner_vlm,
                 flow_threshold=flow_threshold,
                 skip_vlm_verify=skip_vlm_verify,
+                shared_parts=shared_parts,
             )
             log(f"  verify done in {time.time() - t_verify:.1f}s")
 
@@ -1887,6 +2315,7 @@ def execute_progressive(
                 failed_step=current_step,
                 failure_reason=verify.failure_reason or "unknown failure",
                 planner_vlm=planner_vlm,
+                shared_parts=shared_parts,
             )
             retry_count += 1
 
@@ -1914,6 +2343,8 @@ def progressive_pose_edit(
     max_retries: int = 2,
     flow_threshold: float = 0.5,
     skip_vlm_verify: bool = False,
+    skip_trajectory_vlm: bool = False,
+    trajectory_flow_ratio: float = 4.0,
     pre_alignment: Optional[PreAlignDecision] = None,
 ) -> PipelineResult:
     log("\n========== Phase 0: Planning ==========")
@@ -1938,7 +2369,25 @@ def progressive_pose_edit(
         flow_threshold=flow_threshold,
         skip_vlm_verify=skip_vlm_verify,
         output_dir=output_dir,
+        shared_parts=analysis.shared_parts,
     )
+    log("\n========== Phase 1.5: Trajectory Verify ==========")
+    trajectory_verify = verify_trajectory(
+        trajectory=trajectory,
+        target_img=target_img,
+        flow_estimator=flow_estimator,
+        planner_vlm=planner_vlm,
+        shared_parts=analysis.shared_parts,
+        flow_threshold=flow_threshold,
+        skip_trajectory_vlm=skip_trajectory_vlm,
+        max_flow_magnitude_ratio=trajectory_flow_ratio,
+    )
+    trajectory_verify_path = output_dir / "trajectory_verify.json"
+    trajectory_verify_path.write_text(
+        json.dumps(trajectory_verify_to_dict(trajectory_verify), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log(f"[trajectory] Wrote {trajectory_verify_path}")
     return PipelineResult(
         source_img=source_img,
         target_img=target_img,
@@ -1948,6 +2397,7 @@ def progressive_pose_edit(
         verify_results=verify_results,
         final_img=trajectory[-1],
         pre_alignment=pre_alignment,
+        trajectory_verify=trajectory_verify,
     )
 
 
@@ -2041,6 +2491,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--skip_vlm_verify", action="store_true")
     parser.add_argument(
+        "--skip_trajectory_vlm",
+        action="store_true",
+        help="Skip VLM multi-image trajectory review (flow continuity still runs).",
+    )
+    parser.add_argument(
+        "--trajectory_flow_ratio",
+        type=float,
+        default=4.0,
+        help="Max allowed adjacent-pair flow magnitude ratio for trajectory continuity.",
+    )
+    parser.add_argument(
         "--skip_pre_align",
         action="store_true",
         help="Disable VLM-guided deterministic flip/rotate before planning.",
@@ -2065,12 +2526,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def trajectory_verify_to_dict(result: Optional[TrajectoryVerifyResult]) -> Optional[dict[str, Any]]:
+    if result is None:
+        return None
+    return {
+        "overall_ok": result.overall_ok,
+        "failure_reason": result.failure_reason,
+        "flow": {
+            "smooth_ok": result.flow.smooth_ok,
+            "issues": result.flow.issues,
+            "pair_metrics": [asdict(pair) for pair in result.flow.pair_metrics],
+        },
+        "vlm": asdict(result.vlm) if result.vlm is not None else None,
+    }
+
+
 def serializable_result(result: PipelineResult) -> dict[str, Any]:
     return {
         "pre_alignment": asdict(result.pre_alignment) if result.pre_alignment is not None else None,
         "analysis": asdict(result.analysis),
         "instructions": [asdict(step) for step in result.instructions],
         "verify_results": [asdict(verify) for verify in result.verify_results],
+        "trajectory_verify": trajectory_verify_to_dict(result.trajectory_verify),
         "final_image": "final.png",
         "trajectory": [f"step_{idx:02d}.png" for idx in range(len(result.trajectory))],
     }
@@ -2187,6 +2664,8 @@ def main() -> None:
         max_retries=args.max_retries,
         flow_threshold=args.flow_threshold,
         skip_vlm_verify=args.skip_vlm_verify,
+        skip_trajectory_vlm=args.skip_trajectory_vlm,
+        trajectory_flow_ratio=args.trajectory_flow_ratio,
         pre_alignment=pre_alignment,
     )
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
@@ -2202,6 +2681,7 @@ def main() -> None:
     log(f"\nDone. Outputs in {output_dir}")
     log("  step_00.png .. step_NN.png  — editing trajectory")
     log("  plan.json                   — VLM editing plan")
+    log("  trajectory_verify.json      — flow + VLM trajectory continuity")
     log("  final.png                   — final result")
     log("  result.json                 — analysis + verify summary")
 
