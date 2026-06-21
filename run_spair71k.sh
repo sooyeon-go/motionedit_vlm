@@ -11,6 +11,11 @@ set -euo pipefail
 #
 # Each GPU runs one worker with a disjoint shard of pair annotations.
 # Models are loaded once per worker process.
+#
+# Resume: by default (SKIP_EXISTING=1) pairs that already have
+#   <OUTPUT_ROOT>/<split>/<pair_name>/result.json + final.png
+# are skipped; only missing/incomplete pairs are edited.
+# Force re-run everything: SKIP_EXISTING=0 bash run_spair71k.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
@@ -38,6 +43,7 @@ echo "[run_spair71k] dataset_root = ${DATASET_ROOT}"
 echo "[run_spair71k] output_root  = ${OUTPUT_ROOT}"
 echo "[run_spair71k] splits       = ${SPLITS}"
 echo "[run_spair71k] gpus         = ${GPU_IDS} (${NUM_WORKERS} workers)"
+echo "[run_spair71k] skip_existing= ${SKIP_EXISTING} (1=resume, 0=re-run all)"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
 fi
@@ -65,6 +71,8 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
   fi
   if [[ "${SKIP_EXISTING}" == "1" ]]; then
     CMD+=(--skip_existing)
+  else
+    CMD+=(--no-skip_existing)
   fi
   if [[ "${DRY_RUN}" == "1" ]]; then
     CMD+=(--dry_run)

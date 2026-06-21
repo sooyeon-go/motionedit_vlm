@@ -55,7 +55,28 @@ def pair_output_dir(output_root: Path, pair: SpairPair) -> Path:
 
 
 def pair_is_complete(output_dir: Path) -> bool:
+    """True when a previous run finished and wrote the canonical artifacts."""
     return (output_dir / "result.json").is_file() and (output_dir / "final.png").is_file()
+
+
+def partition_assigned_pairs(
+    assigned: list[SpairPair],
+    output_root: Path,
+    skip_existing: bool,
+) -> tuple[list[SpairPair], list[SpairPair]]:
+    """Split worker shard into already-complete vs pending pairs."""
+    if not skip_existing:
+        return assigned, []
+
+    pending: list[SpairPair] = []
+    skipped: list[SpairPair] = []
+    for pair in assigned:
+        out_dir = pair_output_dir(output_root, pair)
+        if pair_is_complete(out_dir):
+            skipped.append(pair)
+        else:
+            pending.append(pair)
+    return pending, skipped
 
 
 def write_pair_meta(output_dir: Path, pair: SpairPair) -> None:
@@ -213,8 +234,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--skip_existing",
-        action="store_true",
-        help="Skip pairs whose output already contains result.json and final.png.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip pairs whose output dir already has result.json and final.png (default: on).",
     )
     parser.add_argument(
         "--dry_run",
@@ -296,18 +318,52 @@ def main() -> None:
     if args.limit is not None:
         assigned = assigned[: args.limit]
 
+    pending, skipped_existing = partition_assigned_pairs(
+        assigned,
+        output_root=output_root,
+        skip_existing=args.skip_existing,
+    )
+
     log(f"total_pairs={len(all_pairs)}, assigned_to_worker={len(assigned)}")
+    if args.skip_existing:
+        log(
+            f"resume scan: complete={len(skipped_existing)}, "
+            f"pending={len(pending)} (missing or incomplete output)"
+        )
+    else:
+        log(f"resume scan: skip_existing=off, pending={len(pending)}")
 
     if args.dry_run:
-        for pair in assigned[:20]:
+        log("[dry_run] Would process pending pairs:")
+        for pair in pending[:20]:
             out_dir = pair_output_dir(output_root, pair)
             log(
-                f"  [{pair.split}] pair_id={pair.pair_id} "
+                f"  PENDING [{pair.split}] pair_id={pair.pair_id} "
                 f"src={pair.src_image_path.name} trg={pair.trg_image_path.name} "
                 f"-> {out_dir}"
             )
-        if len(assigned) > 20:
-            log(f"  ... and {len(assigned) - 20} more")
+        if len(pending) > 20:
+            log(f"  ... and {len(pending) - 20} more pending")
+        if skipped_existing:
+            log(f"[dry_run] Would skip {len(skipped_existing)} complete pair(s)")
+        return
+
+    if not pending:
+        log("[resume] All assigned pairs already complete; nothing to do.")
+        summary = {
+            "worker_id": args.worker_id,
+            "num_workers": args.num_workers,
+            "assigned": len(assigned),
+            "ok": 0,
+            "skipped": len(skipped_existing),
+            "failed": 0,
+            "pending": 0,
+            "output_root": str(output_root),
+            "worker_log": str(worker_log_path),
+        }
+        summary_path = output_root / "logs" / f"worker_{args.worker_id:02d}_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
         return
 
     ppe.log("[deps] Checking runtime dependency versions...")
@@ -364,27 +420,30 @@ def main() -> None:
     log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
 
     ok_count = 0
-    skip_count = 0
+    skip_count = len(skipped_existing)
     fail_count = 0
-    pair_bar = tqdm(assigned, desc=f"Worker {args.worker_id}", unit="pair", disable=args.quiet)
 
-    for pair in pair_bar:
-        out_dir = pair_output_dir(output_root, pair)
-        pair_bar.set_postfix(split=pair.split, pair_id=pair.pair_id)
-
-        if args.skip_existing and pair_is_complete(out_dir):
-            skip_count += 1
+    if skip_count:
+        log(f"[resume] Skipping {skip_count} pair(s) with existing result.json + final.png")
+        for pair in skipped_existing:
+            out_dir = pair_output_dir(output_root, pair)
             append_worker_record(
                 worker_log_path,
                 {
                     "status": "skipped",
+                    "reason": "existing_output",
                     "pair_id": pair.pair_id,
                     "filename": pair.filename,
                     "split": pair.split,
                     "output_dir": str(out_dir),
                 },
             )
-            continue
+
+    pair_bar = tqdm(pending, desc=f"Worker {args.worker_id}", unit="pair", disable=args.quiet)
+
+    for pair in pair_bar:
+        out_dir = pair_output_dir(output_root, pair)
+        pair_bar.set_postfix(split=pair.split, pair_id=pair.pair_id)
 
         try:
             record = run_single_pair(
@@ -417,9 +476,11 @@ def main() -> None:
         "worker_id": args.worker_id,
         "num_workers": args.num_workers,
         "assigned": len(assigned),
+        "pending": len(pending),
         "ok": ok_count,
         "skipped": skip_count,
         "failed": fail_count,
+        "skip_existing": args.skip_existing,
         "output_root": str(output_root),
         "worker_log": str(worker_log_path),
     }
