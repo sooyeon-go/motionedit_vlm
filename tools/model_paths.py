@@ -11,6 +11,9 @@ PLANNER_VLM_MODEL = SHARED_PRETRAINED_ROOT / "Qwen3-VL-8B-Instruct"
 
 # Downloaded into motionedit_vlm/
 MOTIONEDIT_LORA_DIR = MOTIONEDIT_VLM_DIR / "motionedit-lora"
+QWEN_ANGLES_LORA_DIR = MOTIONEDIT_VLM_DIR / "qwen-angles-lora"
+QWEN_ANGLES_LORA_REPO = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+QWEN_ANGLES_LORA_WEIGHT = "qwen-image-edit-2511-multiple-angles-lora.safetensors"
 DINOV2_MODEL = MOTIONEDIT_VLM_DIR / "dinov2-base"
 UNIMATCH_DIR = MOTIONEDIT_VLM_DIR / "unimatch"
 UNIMATCH_CKPT = (

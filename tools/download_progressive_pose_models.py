@@ -6,6 +6,7 @@ Models already on shared storage (not downloaded here):
 
 Downloaded into /data/shared-vilab/pretrained_models/motionedit_vlm/:
   - motionedit-lora/          (elaine1wan/motionedit adapter)
+  - qwen-angles-lora/         (fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA)
   - dinov2-base/              (facebook/dinov2-base)
   - unimatch/pretrained/...   (UniMatch optical flow checkpoint)
 
@@ -37,6 +38,9 @@ from model_paths import (  # noqa: E402
     MOTIONEDIT_LORA_DIR,
     MOTIONEDIT_VLM_DIR,
     PLANNER_VLM_MODEL,
+    QWEN_ANGLES_LORA_DIR,
+    QWEN_ANGLES_LORA_REPO,
+    QWEN_ANGLES_LORA_WEIGHT,
     UNIMATCH_CKPT,
     UNIMATCH_DIR,
 )
@@ -98,6 +102,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_token", default=None, help="Optional Hugging Face token.")
 
     parser.add_argument("--motionedit_lora_repo", default="elaine1wan/motionedit")
+    parser.add_argument(
+        "--angles_lora_repo",
+        default=QWEN_ANGLES_LORA_REPO,
+        help="HF repo for Qwen-Image-Edit multi-angle camera LoRA.",
+    )
+    parser.add_argument(
+        "--angles_lora_filename",
+        default=QWEN_ANGLES_LORA_WEIGHT,
+        help="LoRA weight filename inside the angles repo.",
+    )
     parser.add_argument("--dinov2_repo", default="facebook/dinov2-base")
 
     parser.add_argument(
@@ -123,6 +137,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--skip_motionedit_lora", action="store_true")
+    parser.add_argument("--skip_angles_lora", action="store_true")
+    parser.add_argument(
+        "--angles_lora_only",
+        action="store_true",
+        help="Download only the Qwen multi-angle LoRA.",
+    )
     parser.add_argument("--skip_dinov2", action="store_true")
     parser.add_argument("--skip_unimatch", action="store_true")
     return parser.parse_args()
@@ -141,7 +161,9 @@ def main() -> None:
         ),
     }
 
-    if not args.skip_motionedit_lora:
+    angles_only = args.angles_lora_only
+
+    if not args.skip_motionedit_lora and not angles_only:
         lora_dir = models_dir / "motionedit-lora"
         manifest["motionedit_lora_adapter"] = download_file(
             repo_id=args.motionedit_lora_repo,
@@ -156,14 +178,23 @@ def main() -> None:
             token=token,
         )
 
-    if not args.skip_dinov2:
+    if not args.skip_angles_lora:
+        angles_dir = models_dir / "qwen-angles-lora"
+        manifest["qwen_angles_lora"] = download_file(
+            repo_id=args.angles_lora_repo,
+            filename=args.angles_lora_filename,
+            destination_root=angles_dir,
+            token=token,
+        )
+
+    if not args.skip_dinov2 and not angles_only:
         manifest["dinov2"] = download_snapshot(
             repo_id=args.dinov2_repo,
             destination=models_dir / "dinov2-base",
             token=token,
         )
 
-    if not args.skip_unimatch:
+    if not args.skip_unimatch and not angles_only:
         manifest["unimatch"] = download_file(
             repo_id=args.unimatch_repo_id,
             repo_type=args.unimatch_repo_type,
