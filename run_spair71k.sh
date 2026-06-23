@@ -22,7 +22,7 @@ cd "${REPO_ROOT}"
 
 GPU_IDS="${GPU_IDS:-0}"
 DATASET_ROOT="${DATASET_ROOT:-/data/shared-vilab/datasets/spair-71k/SPair-71k}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit_newver}"
 # Processed in fixed order: test -> val -> trn (train), regardless of list order here.
 SPLITS="${SPLITS:-test,val,trn}"
 N_STEPS="${N_STEPS:-5}"
