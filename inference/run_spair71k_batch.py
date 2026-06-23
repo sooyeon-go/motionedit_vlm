@@ -35,6 +35,7 @@ if str(INFERENCE_DIR) not in sys.path:
 import progressive_pose_edit as ppe  # noqa: E402
 from spair71k_pairs import (  # noqa: E402
     SpairPair,
+    interleave_pairs_by_category,
     iter_pair_annotation_files,
     load_spair_pair,
     normalize_splits,
@@ -135,13 +136,15 @@ def run_single_pair(
     if args.skip_pre_align:
         ppe.save_image(aligned_source_img, output_dir / "step_00.png")
     else:
-        aligned_source_img, pre_alignment, _ = ppe.pre_align_source(
+        aligned_source_img, pre_alignment, _ = ppe.pre_align_source_until_verified(
             source_img=source_img,
             target_img=target_img,
             planner_vlm=planner_vlm,
             output_dir=output_dir,
             min_confidence=args.pre_align_min_confidence,
             max_rotation=args.max_pre_align_rotation,
+            max_attempts=args.max_prealign_verify_attempts,
+            bruteforce_after_attempts=args.prealign_bruteforce_after_attempts,
         )
         ppe.save_image(aligned_source_img, output_dir / "aligned_source.png")
         ppe.save_image(aligned_source_img, output_dir / "step_00.png")
@@ -163,6 +166,8 @@ def run_single_pair(
         pre_alignment=pre_alignment,
         skip_trajectory_repair=args.skip_trajectory_repair,
         max_trajectory_repairs=args.max_trajectory_repairs,
+        max_pose_steps=args.max_pose_steps,
+        max_planning_attempts=args.max_planning_attempts,
     )
 
     ppe.save_image(result.final_img, output_dir / "final.png")
@@ -239,6 +244,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip pairs whose output dir already has result.json and final.png (default: on).",
     )
     parser.add_argument(
+        "--interleave_classes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Round-robin across categories within each split "
+            "(aeroplane, bicycle, bus, ...) instead of class-by-class blocks (default: on)."
+        ),
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="List assigned pairs without loading models or running the pipeline.",
@@ -256,6 +270,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--editor_base_model", default=str(ppe.DEFAULT_EDITOR_BASE_MODEL))
     parser.add_argument("--motionedit_lora_path", default=str(ppe.DEFAULT_MOTIONEDIT_LORA_PATH))
+    parser.add_argument("--qwen_angles_lora_path", default=str(ppe.DEFAULT_QWEN_ANGLES_LORA_PATH))
     parser.add_argument("--planner_vlm", default=str(ppe.DEFAULT_PLANNER_VLM))
     parser.add_argument("--dinov2_model", default=str(ppe.DEFAULT_DINOV2_MODEL))
     parser.add_argument("--unimatch_ckpt", default=str(ppe.DEFAULT_UNIMATCH_CKPT))
@@ -277,6 +292,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip_pre_align", action="store_true")
     parser.add_argument("--pre_align_min_confidence", type=float, default=0.60)
     parser.add_argument("--max_pre_align_rotation", type=float, default=30.0)
+    parser.add_argument("--max_prealign_verify_attempts", type=int, default=0)
+    parser.add_argument("--prealign_bruteforce_after_attempts", type=int, default=5)
+    parser.add_argument("--max_pose_steps", type=int, default=6)
+    parser.add_argument("--max_planning_attempts", type=int, default=0)
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -314,21 +333,30 @@ def main() -> None:
     for annotation_path in iter_pair_annotation_files(pair_annotation_dir, splits=splits):
         all_pairs.append(load_spair_pair(annotation_path, dataset_root))
 
+    if args.interleave_classes:
+        all_pairs = interleave_pairs_by_category(all_pairs)
+
     assigned = shard_items(all_pairs, worker_id=args.worker_id, num_workers=args.num_workers)
     if args.limit is not None:
         assigned = assigned[: args.limit]
 
+    scan_started = time.time()
     pending, skipped_existing = partition_assigned_pairs(
         assigned,
         output_root=output_root,
         skip_existing=args.skip_existing,
     )
+    scan_elapsed = time.time() - scan_started
 
     log(f"total_pairs={len(all_pairs)}, assigned_to_worker={len(assigned)}")
+    log(
+        f"pair_order={'class round-robin' if args.interleave_classes else 'annotation filename sort'}"
+    )
     if args.skip_existing:
         log(
             f"resume scan: complete={len(skipped_existing)}, "
-            f"pending={len(pending)} (missing or incomplete output)"
+            f"pending={len(pending)} (missing or incomplete output), "
+            f"scan_time={scan_elapsed:.2f}s"
         )
     else:
         log(f"resume scan: skip_existing=off, pending={len(pending)}")
@@ -374,6 +402,7 @@ def main() -> None:
         ppe.validate_pretrained_paths(
             editor_base_model=args.editor_base_model,
             motionedit_lora_path=args.motionedit_lora_path,
+            qwen_angles_lora_path=args.qwen_angles_lora_path,
             planner_vlm=args.planner_vlm,
             dinov2_model=args.dinov2_model,
             unimatch_ckpt=args.unimatch_ckpt,
@@ -395,6 +424,7 @@ def main() -> None:
     editor = ppe.MotionNFTEditor(
         base_model=args.editor_base_model,
         lora_path=args.motionedit_lora_path,
+        angle_lora_path=args.qwen_angles_lora_path,
         device=args.device,
         device_map=args.editor_device_map,
         dtype=dtype,

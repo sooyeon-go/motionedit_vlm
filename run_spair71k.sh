@@ -28,8 +28,13 @@ SPLITS="${SPLITS:-test,val,trn}"
 N_STEPS="${N_STEPS:-5}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 SEED="${SEED:-42}"
+MAX_PREALIGN_VERIFY_ATTEMPTS="${MAX_PREALIGN_VERIFY_ATTEMPTS:-0}"
+PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS="${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS:-5}"
+MAX_PLANNING_ATTEMPTS="${MAX_PLANNING_ATTEMPTS:-0}"
+MAX_POSE_STEPS="${MAX_POSE_STEPS:-6}"
 LIMIT="${LIMIT:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+INTERLEAVE_CLASSES="${INTERLEAVE_CLASSES:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -44,6 +49,11 @@ echo "[run_spair71k] output_root  = ${OUTPUT_ROOT}"
 echo "[run_spair71k] splits       = ${SPLITS}"
 echo "[run_spair71k] gpus         = ${GPU_IDS} (${NUM_WORKERS} workers)"
 echo "[run_spair71k] skip_existing= ${SKIP_EXISTING} (1=resume, 0=re-run all)"
+echo "[run_spair71k] interleave_classes=${INTERLEAVE_CLASSES} (1=round-robin per class, 0=class blocks)"
+echo "[run_spair71k] prealign_verify_attempts = ${MAX_PREALIGN_VERIFY_ATTEMPTS} (0=use bruteforce threshold)"
+echo "[run_spair71k] prealign_bruteforce_after = ${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS} (unique flip/rotate VLM pick, typically 8)"
+echo "[run_spair71k] planning_attempts        = ${MAX_PLANNING_ATTEMPTS} (0=unlimited)"
+echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
 fi
@@ -63,6 +73,10 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     --n_steps "${N_STEPS}"
     --max_retries "${MAX_RETRIES}"
     --seed "${SEED}"
+    --max_prealign_verify_attempts "${MAX_PREALIGN_VERIFY_ATTEMPTS}"
+    --prealign_bruteforce_after_attempts "${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS}"
+    --max_planning_attempts "${MAX_PLANNING_ATTEMPTS}"
+    --max_pose_steps "${MAX_POSE_STEPS}"
     --device cuda
   )
 
@@ -73,6 +87,11 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     CMD+=(--skip_existing)
   else
     CMD+=(--no-skip_existing)
+  fi
+  if [[ "${INTERLEAVE_CLASSES}" == "1" ]]; then
+    CMD+=(--interleave_classes)
+  else
+    CMD+=(--no-interleave_classes)
   fi
   if [[ "${DRY_RUN}" == "1" ]]; then
     CMD+=(--dry_run)

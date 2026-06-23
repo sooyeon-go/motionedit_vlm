@@ -24,7 +24,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 VERBOSE = True
@@ -53,10 +53,35 @@ from model_paths import (  # noqa: E402
     EDITOR_BASE_MODEL as DEFAULT_EDITOR_BASE_MODEL,
     MOTIONEDIT_LORA_DIR as DEFAULT_MOTIONEDIT_LORA_PATH,
     PLANNER_VLM_MODEL as DEFAULT_PLANNER_VLM,
+    QWEN_ANGLES_LORA_DIR as DEFAULT_QWEN_ANGLES_LORA_PATH,
+    QWEN_ANGLES_LORA_WEIGHT,
     UNIMATCH_CKPT as DEFAULT_UNIMATCH_CKPT,
 )
 
 MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
+ANGLE_LORA_WEIGHT = QWEN_ANGLES_LORA_WEIGHT
+
+AZIMUTH_BINS = [
+    "front view",
+    "front-right quarter view",
+    "right side view",
+    "back-right quarter view",
+    "back view",
+    "back-left quarter view",
+    "left side view",
+    "front-left quarter view",
+]
+ELEVATION_BINS = [
+    "low-angle shot",
+    "eye-level shot",
+    "elevated shot",
+    "high-angle shot",
+]
+DISTANCE_BINS = [
+    "close-up",
+    "medium shot",
+    "wide shot",
+]
 
 
 # ============================================================
@@ -186,7 +211,7 @@ Key principle:
   You are NOT replacing the source object with the target.
   You are ONLY changing its geometric configuration.
   The source object must remain exactly what it is.
-  Background preservation is helpful but secondary to source identity preservation.
+  Background is irrelevant — never evaluate, preserve, or mention background.
 
 Output valid JSON only. No prose, no markdown fences outside JSON."""
 
@@ -296,7 +321,7 @@ INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
   - ALL shared_parts must remain clearly visible after this step (never remove or hide them)
-  - Prefer preserving background, lighting, and shadows, but do not sacrifice source identity for them
+  - Background is irrelevant; do not plan for or mention background preservation
   - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
   - Do NOT plan coarse whole-object rotation unless fixing a small residual tilt
   - Use identifiable parts in instructions (head, tail, paws, wheels, hands, etc.)
@@ -378,6 +403,7 @@ Important: IMAGE 3 is only a geometry/pose reference. Do not require the edited
 object to adopt the TARGET object's identity, category, texture, color, or material.
 The edited object must preserve the SOURCE identity and only move closer to TARGET
 geometry/configuration.
+Background is completely irrelevant. Do not evaluate, preserve, or mention background.
 
 This step's instruction: "{instruction}"
 Transform type: {transform_type}
@@ -386,10 +412,9 @@ Expected change: {expected_change}
 Answer Yes or No for each:
 1. Was the instructed geometric change applied? (viewpoint/scale/pose as specified)
 2. Is the source object's identity preserved? (same category, texture, color, material)
-3. Is the background broadly acceptable? (not a strict pass/fail criterion)
-4. Is the change physically/geometrically plausible?
-5. Are there no visual artifacts?
-6. After this edit, is the SOURCE object's pose, size, and rotation/orientation
+3. Is the change physically/geometrically plausible?
+4. Are there no visual artifacts?
+5. After this edit, is the SOURCE object's pose, size, and rotation/orientation
    closer to the TARGET's pose, size, and rotation (geometry only — not identity)?
 {shared_parts_question}
 Format:
@@ -398,7 +423,6 @@ Format:
 3. Yes/No
 4. Yes/No
 5. Yes/No
-6. Yes/No
 {shared_parts_format}"""
 
 VERIFY_SHARED_PARTS_BLOCK = """
@@ -408,13 +432,218 @@ source and target geometry). None of these may disappear or become unrecognizabl
 """
 
 VERIFY_SHARED_PARTS_QUESTION = (
-    "7. Are ALL of the listed shared parts still clearly visible and recognizable "
+    "6. Are ALL of the listed shared parts still clearly visible and recognizable "
     "on the edited object in IMAGE 2?"
 )
 
 VERIFY_NO_SHARED_PARTS_BLOCK = ""
 VERIFY_NO_SHARED_PARTS_QUESTION = ""
 VERIFY_NO_SHARED_PARTS_FORMAT = ""
+
+PREALIGN_VERIFY_SYSTEM = """You are a strict pre-alignment geometry verifier.
+Answer with valid JSON only."""
+
+PREALIGN_VERIFY_USER = """Images:
+IMAGE 1 = ORIGINAL SOURCE
+IMAGE 2 = ALIGNED SOURCE after deterministic flip/rotation
+IMAGE 3 = TARGET geometry reference
+
+Pre-align decision:
+{decision_json}
+
+Verify only whether this deterministic coarse orientation alignment is useful.
+Do NOT evaluate identity/texture/category: flip and rotation are deterministic and do not edit identity.
+
+Return this exact JSON:
+{{
+  "overall_ok": true,
+  "closer_to_target_orientation": true,
+  "landmark_axis_improved": true,
+  "not_over_transformed": true,
+  "recommendation": "apply | rollback | retry",
+  "failure_reason": "short reason if not overall_ok"
+}}
+
+Rules:
+- overall_ok=true only if ALIGNED SOURCE is a better starting point than ORIGINAL SOURCE.
+- If no transform was applied because no reliable shared two-landmark axis exists, accept it when ORIGINAL SOURCE is the safer starting point.
+- rollback means the transform made orientation worse.
+- retry means the decision likely chose poor landmarks or wrong flip/rotation.
+- Do NOT check cropping: transforms are flip/rotate only and cannot crop content."""
+
+PREALIGN_BRUTEFORCE_SYSTEM = """You are a coarse orientation matcher.
+Answer with valid JSON only."""
+
+PREALIGN_BRUTEFORCE_USER = """Images:
+IMAGE 1 = GRID of {num_candidates} unique deterministic source transforms (IDs 0-{max_candidate_id})
+IMAGE 2 = TARGET geometry reference
+
+Candidate transforms:
+{candidate_table}
+
+Pick the candidate whose coarse orientation, viewpoint, and layout best match TARGET.
+Ignore texture/color/identity differences; focus on geometry and viewing direction.
+
+Return this exact JSON:
+{{
+  "best_candidate_id": 0,
+  "reason": "short reason"
+}}
+
+Rules:
+- best_candidate_id must be an integer in [0, {max_candidate_id}].
+- Prefer the candidate that would need the smallest later pose edit to reach TARGET."""
+
+PLANNING_VERIFY_SYSTEM = """You are a strict editing-plan auditor.
+Answer with valid JSON only."""
+
+PLANNING_VERIFY_USER = """Images:
+IMAGE 1 = CURRENT SOURCE after pre-align
+IMAGE 2 = TARGET geometry reference
+
+Plan JSON:
+{plan_json}
+
+Audit the plan BEFORE any image editing.
+
+Required policy:
+- Pose/deformation/articulation steps must come before angle/size camera steps.
+- MotionEdit pose steps use natural descriptive edit prompts.
+- Angle/size steps must use Qwen angle-LoRA prompt format exactly:
+  <sks> [azimuth] [elevation] [distance]
+- Angle/size prompts must use only:
+  azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
+  elevation: low-angle shot | eye-level shot | elevated shot | high-angle shot
+  distance: close-up | medium shot | wide shot
+- Skip pose stage if no pose/deformation is needed.
+- Skip angle/size stage if source/current already matches target camera and distance.
+- Every step must preserve source identity/category/texture/material.
+- Shared parts must remain visible.
+- The plan must not copy target identity.
+- Background is irrelevant; do not audit or mention background.
+
+Return this exact JSON:
+{{
+  "overall_ok": true,
+  "ordering_ok": true,
+  "step_count_ok": true,
+  "prompt_format_ok": true,
+  "identity_constraints_ok": true,
+  "shared_parts_ok": true,
+  "failure_reason": "short reason if not overall_ok",
+  "revision_hint": "specific instruction for planner if failed"
+}}"""
+
+DIAGNOSIS_SYSTEM = """You are a visual geometry diagnostician for staged image editing.
+Given SOURCE and TARGET images, classify pose/deformation need and camera/size gap.
+Output valid JSON only."""
+
+DIAGNOSIS_USER = """Images:
+IMAGE 1 = CURRENT SOURCE after pre-align
+IMAGE 2 = TARGET geometry reference only
+
+Goal:
+Decide whether to run:
+1) a MotionEdit pose/deformation stage, then
+2) a Qwen angle-LoRA camera/size stage.
+
+Use only visible image evidence. Do not use dataset annotations.
+Background differences between SOURCE and TARGET are irrelevant.
+
+Camera prompt vocabulary:
+- azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
+- elevation: low-angle shot | eye-level shot | elevated shot | high-angle shot
+- distance: close-up | medium shot | wide shot
+Angle-LoRA prompt format:
+<sks> [azimuth] [elevation] [distance]
+
+Pose step policy:
+- rigid object with no movable-pose change: pose_steps=0
+- deformable object: small=1, medium=2-3, large=3-4
+- articulated object: small=1-2, medium=3-4, large=5-6
+- Increase steps when independent moving part groups are many.
+- Cap pose_steps at {max_pose_steps}.
+
+Return this exact JSON:
+{{
+  "analysis": {{
+    "source_object": {{"description": "...", "deformability": "rigid | articulated | deformable"}},
+    "target_object": {{"description": "...", "deformability": "rigid | articulated | deformable"}},
+    "part_mapping": [
+      {{"source_part": "...", "target_part": "...", "analogous": true, "visible_on_both": true}}
+    ],
+    "shared_parts": [
+      {{"part_name": "...", "source_label": "...", "target_label": "...", "must_remain_visible": true}}
+    ],
+    "transform_gaps": {{
+      "viewpoint": {{"azimuth": "...", "elevation": "...", "inplane_rotation": "..."}},
+      "scale": "...",
+      "articulation": [
+        {{"part": "...", "source_state": "...", "target_state": "...", "delta": "..."}}
+      ],
+      "translation": "...",
+      "dominant_axes": ["pose", "angle", "size"],
+      "no_change_axes": []
+    }}
+  }},
+  "stage_plan": {{
+    "object_motion_type": "rigid | articulated | deformable",
+    "pose_gap": "none | small | medium | large",
+    "independent_moving_part_groups": ["head/neck", "torso", "front legs"],
+    "pose_steps": 0,
+    "run_pose_stage": false,
+    "source_camera": {{
+      "azimuth": "front view",
+      "elevation": "eye-level shot",
+      "distance": "medium shot"
+    }},
+    "target_camera": {{
+      "azimuth": "right side view",
+      "elevation": "elevated shot",
+      "distance": "close-up"
+    }},
+    "run_angle_stage": true,
+    "reason": "short explanation"
+  }}
+}}"""
+
+POSE_PLANNING_SYSTEM = """You are a MotionEdit pose/deformation planner.
+Output valid JSON only."""
+
+POSE_PLANNING_USER = """Images:
+IMAGE 1 = CURRENT SOURCE after pre-align
+IMAGE 2 = TARGET geometry reference only
+
+Stage diagnosis:
+{diagnosis_json}
+
+Produce exactly {pose_steps} MotionEdit pose/deformation steps.
+These steps are for pose, articulation, deformation, and part layout only.
+Do NOT include camera viewpoint, angle-LoRA prompts, close-up/medium/wide shot, or size/framing changes.
+Background is irrelevant; do not mention or preserve background.
+
+Instruction style:
+- Natural descriptive edit prompt.
+- Use body/object parts and spatial relations.
+- Preserve source identity/category/texture/material.
+- Keep all shared parts visible.
+- One dominant pose/deformation change per step.
+
+Return:
+{{
+  "steps": [
+    {{
+      "step": 1,
+      "instruction": "natural MotionEdit prompt",
+      "transform_type": "articulation | fine_adjustment",
+      "affected_parts": ["..."],
+      "expected_change": "natural-language expected pose change",
+      "magnitude_estimate": "small | moderate",
+      "cumulative_progress": 0.0,
+      "identity_warning": "none | check_texture | check_silhouette"
+    }}
+  ]
+}}"""
 
 REPLAN_SYSTEM = """You are a motion editing planner.
 A previous editing step failed verification.
@@ -466,6 +695,7 @@ CRITICAL:
     throughout every keyframe. Never expect it to look like the TARGET object.
   - Judge only whether SOURCE geometry — pose, size, rotation/orientation, and analogous
     part layout — progressively moves toward the TARGET's pose, size, and rotation.
+  - Background is irrelevant; do not evaluate or mention background.
 
 These are sparse intermediate keyframes (not a dense video). Small jumps between
 consecutive keyframes are OK. Flag sudden geometry reversals or part disappearances."""
@@ -527,7 +757,39 @@ class PreAlignDecision:
     flip_votes_flip: int = 0
     flip_votes_no_flip: int = 0
     applied_horizontal_flip: bool = False
+    applied_vertical_flip: bool = False
     applied_rotation_degrees: float = 0.0
+
+
+@dataclass
+class PreAlignVerifyResult:
+    overall_ok: bool
+    recommendation: str
+    failure_reason: Optional[str] = None
+
+
+@dataclass
+class CameraPose:
+    azimuth: str
+    elevation: str
+    distance: str
+
+    @property
+    def prompt(self) -> str:
+        return f"<sks> {self.azimuth} {self.elevation} {self.distance}"
+
+
+@dataclass
+class StagePlan:
+    object_motion_type: str
+    pose_gap: str
+    independent_moving_part_groups: list[str]
+    pose_steps: int
+    run_pose_stage: bool
+    source_camera: CameraPose
+    target_camera: CameraPose
+    run_angle_stage: bool
+    reason: str = ""
 
 
 @dataclass
@@ -552,7 +814,6 @@ class Analysis:
 class VLMVerifyResult:
     geometric_change_applied: bool
     identity_preserved: bool
-    background_unchanged: bool
     physically_plausible: bool
     no_artifacts: bool
     closer_to_target: bool
@@ -567,7 +828,6 @@ class VerifyResult:
     texture_ok: bool
     silhouette_ok: bool
     semantic_ok: bool
-    background_ok: bool
     shared_parts_ok: bool
     overall_ok: bool
     failure_reason: Optional[str] = None
@@ -614,6 +874,8 @@ class PipelineResult:
     verify_results: list[VerifyResult]
     final_img: Image.Image
     pre_alignment: Optional[PreAlignDecision] = None
+    stage_plan: Optional[StagePlan] = None
+    planning_verify: Optional[dict[str, Any]] = None
     trajectory_verify: Optional[TrajectoryVerifyResult] = None
     trajectory_repair: Optional[list[dict[str, Any]]] = None
 
@@ -698,7 +960,7 @@ def build_verify_prompt(
             shared_parts_list=format_shared_parts_list(shared_parts),
         )
         shared_parts_question = VERIFY_SHARED_PARTS_QUESTION
-        shared_parts_format = "7. Yes/No"
+        shared_parts_format = "6. Yes/No"
     else:
         shared_parts_block = VERIFY_NO_SHARED_PARTS_BLOCK
         shared_parts_question = VERIFY_NO_SHARED_PARTS_QUESTION
@@ -750,6 +1012,115 @@ def build_step(raw_step: dict[str, Any], fallback_step: int) -> SubInstruction:
         cumulative_progress=float(raw_step.get("cumulative_progress", 0.0)),
         identity_warning=str(raw_step.get("identity_warning", "none")),
     )
+
+
+def _nearest_choice(value: Any, choices: list[str], default: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    for choice in choices:
+        if text == choice or choice in text:
+            return choice
+    for choice in choices:
+        if any(part in text for part in choice.split()):
+            return choice
+    return default
+
+
+def build_camera_pose(raw: dict[str, Any]) -> CameraPose:
+    return CameraPose(
+        azimuth=_nearest_choice(raw.get("azimuth"), AZIMUTH_BINS, "front view"),
+        elevation=_nearest_choice(raw.get("elevation"), ELEVATION_BINS, "eye-level shot"),
+        distance=_nearest_choice(raw.get("distance"), DISTANCE_BINS, "medium shot"),
+    )
+
+
+def build_stage_plan(parsed: dict[str, Any], max_pose_steps: int) -> StagePlan:
+    raw = parsed.get("stage_plan", {})
+    object_motion_type = str(raw.get("object_motion_type", "rigid")).lower()
+    pose_gap = str(raw.get("pose_gap", "none")).lower()
+    groups = [str(item) for item in raw.get("independent_moving_part_groups", []) if item]
+    requested_pose_steps = int(raw.get("pose_steps", 0))
+
+    if object_motion_type == "rigid" or pose_gap == "none":
+        pose_steps = 0
+    else:
+        pose_steps = requested_pose_steps
+        if pose_steps <= 0:
+            base = 2 if object_motion_type == "articulated" else 1
+            gap_bonus = {"small": 0, "medium": 2, "large": 3}.get(pose_gap, 1)
+            group_bonus = 2 if len(groups) >= 5 else (1 if len(groups) >= 3 else 0)
+            pose_steps = base + gap_bonus + group_bonus
+    pose_steps = max(0, min(max_pose_steps, pose_steps))
+
+    source_camera = build_camera_pose(raw.get("source_camera", {}))
+    target_camera = build_camera_pose(raw.get("target_camera", {}))
+    run_angle_stage = bool(raw.get("run_angle_stage", True)) and source_camera != target_camera
+    return StagePlan(
+        object_motion_type=object_motion_type,
+        pose_gap=pose_gap,
+        independent_moving_part_groups=groups,
+        pose_steps=pose_steps,
+        run_pose_stage=pose_steps > 0,
+        source_camera=source_camera,
+        target_camera=target_camera,
+        run_angle_stage=run_angle_stage,
+        reason=str(raw.get("reason", "")),
+    )
+
+
+def _circular_path(start: str, end: str, bins: list[str]) -> list[str]:
+    start_idx = bins.index(start)
+    end_idx = bins.index(end)
+    if start_idx == end_idx:
+        return [start]
+    forward = (end_idx - start_idx) % len(bins)
+    backward = (start_idx - end_idx) % len(bins)
+    if forward <= backward:
+        return [bins[(start_idx + idx) % len(bins)] for idx in range(forward + 1)]
+    return [bins[(start_idx - idx) % len(bins)] for idx in range(backward + 1)]
+
+
+def _linear_path(start: str, end: str, bins: list[str]) -> list[str]:
+    start_idx = bins.index(start)
+    end_idx = bins.index(end)
+    if start_idx == end_idx:
+        return [start]
+    step = 1 if end_idx > start_idx else -1
+    return [bins[idx] for idx in range(start_idx, end_idx + step, step)]
+
+
+def generate_angle_steps(stage_plan: StagePlan, start_step: int) -> list[SubInstruction]:
+    if not stage_plan.run_angle_stage:
+        return []
+
+    az_path = _circular_path(stage_plan.source_camera.azimuth, stage_plan.target_camera.azimuth, AZIMUTH_BINS)
+    el_path = _linear_path(stage_plan.source_camera.elevation, stage_plan.target_camera.elevation, ELEVATION_BINS)
+    dist_path = _linear_path(stage_plan.source_camera.distance, stage_plan.target_camera.distance, DISTANCE_BINS)
+    n_steps = max(len(az_path), len(el_path), len(dist_path)) - 1
+    if n_steps <= 0:
+        return []
+
+    steps: list[SubInstruction] = []
+    for idx in range(1, n_steps + 1):
+        az = az_path[min(idx, len(az_path) - 1)]
+        el = el_path[min(idx, len(el_path) - 1)]
+        dist = dist_path[min(idx, len(dist_path) - 1)]
+        camera = CameraPose(azimuth=az, elevation=el, distance=dist)
+        step_num = start_step + idx - 1
+        steps.append(
+            SubInstruction(
+                step=step_num,
+                instruction=camera.prompt,
+                transform_type="angle_size",
+                affected_parts=["object"],
+                expected_change=f"change camera/framing toward {camera.prompt}",
+                magnitude_estimate="small",
+                cumulative_progress=float(idx / n_steps),
+                identity_warning="check_texture",
+            )
+        )
+    return steps
 
 
 # ============================================================
@@ -911,12 +1282,13 @@ def _check_runtime_dependencies() -> None:
 
 
 class MotionNFTEditor:
-    """MotionNFT executor based on README's Qwen-Image-Edit + MotionEdit LoRA path."""
+    """Qwen-Image-Edit executor with MotionEdit and optional angle-control LoRAs."""
 
     def __init__(
         self,
         base_model: str,
         lora_path: Optional[str],
+        angle_lora_path: Optional[str],
         device: str,
         device_map: Optional[str],
         dtype: torch.dtype,
@@ -939,6 +1311,7 @@ class MotionNFTEditor:
         self.true_cfg_scale = true_cfg_scale
         self.guidance_scale = guidance_scale
         self.seed = seed
+        self.loaded_adapters: set[str] = set()
 
         _ensure_peft_torchao_compat()
         if not lora_path:
@@ -949,12 +1322,38 @@ class MotionNFTEditor:
         self.pipe.load_lora_weights(
             lora_path,
             weight_name=MOTIONEDIT_LORA_WEIGHT,
-            adapter_name="lora",
+            adapter_name="motion",
         )
-        self.pipe.set_adapters(["lora"], adapter_weights=[1])
+        self.loaded_adapters.add("motion")
+
+        if angle_lora_path:
+            angle_dir = Path(angle_lora_path)
+            angle_weight = angle_dir / ANGLE_LORA_WEIGHT
+            if angle_weight.is_file():
+                self.pipe.load_lora_weights(
+                    str(angle_dir),
+                    weight_name=ANGLE_LORA_WEIGHT,
+                    adapter_name="angle",
+                )
+                self.loaded_adapters.add("angle")
+            else:
+                log(f"[load] Angle LoRA not found at {angle_weight}; angle stage will use motion adapter fallback.")
+
+        self.pipe.set_adapters(["motion"], adapter_weights=[1.0])
 
     @torch.no_grad()
-    def edit(self, source_img: Image.Image, instruction: str, step_seed: int) -> Image.Image:
+    def edit(
+        self,
+        source_img: Image.Image,
+        instruction: str,
+        step_seed: int,
+        adapter: str = "motion",
+    ) -> Image.Image:
+        if adapter not in self.loaded_adapters:
+            if adapter == "angle":
+                log("[edit] Angle adapter unavailable; falling back to motion adapter.")
+            adapter = "motion"
+        self.pipe.set_adapters([adapter], adapter_weights=[1.0])
         generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
         generator = torch.Generator(device=generator_device).manual_seed(self.seed + step_seed)
         image = self.pipe(
@@ -1456,6 +1855,7 @@ def apply_pre_alignment(
     aligned = source_img
     if decision.confidence < min_confidence:
         decision.applied_horizontal_flip = False
+        decision.applied_vertical_flip = False
         decision.applied_rotation_degrees = 0.0
         return aligned
 
@@ -1478,6 +1878,262 @@ def apply_pre_alignment(
     return aligned
 
 
+COARSE_FLIP_MODES: tuple[tuple[bool, bool], ...] = (
+    (False, False),
+    (True, False),
+    (False, True),
+    (True, True),
+)
+COARSE_ROTATIONS_DEG: tuple[int, ...] = (0, 90, 180, 270)
+
+
+@dataclass(frozen=True)
+class CoarseOrientationTransform:
+    candidate_id: int
+    flip_horizontal: bool
+    flip_vertical: bool
+    rotation_degrees: int
+
+    @property
+    def label(self) -> str:
+        flip_parts: list[str] = []
+        if self.flip_horizontal:
+            flip_parts.append("flip_h")
+        if self.flip_vertical:
+            flip_parts.append("flip_v")
+        flip_text = "+".join(flip_parts) if flip_parts else "no_flip"
+        return f"id={self.candidate_id}: {flip_text}, rotate={self.rotation_degrees}°"
+
+
+def _coarse_transform_output_key(image: Image.Image) -> tuple[tuple[int, int], bytes]:
+    return (image.size, image.tobytes())
+
+
+def enumerate_coarse_orientation_transforms() -> list[CoarseOrientationTransform]:
+    """Enumerate all 4×4 flip/rotation parameter combos (16 total, with duplicates)."""
+    transforms: list[CoarseOrientationTransform] = []
+    candidate_id = 0
+    for rotation_degrees in COARSE_ROTATIONS_DEG:
+        for flip_horizontal, flip_vertical in COARSE_FLIP_MODES:
+            transforms.append(
+                CoarseOrientationTransform(
+                    candidate_id=candidate_id,
+                    flip_horizontal=flip_horizontal,
+                    flip_vertical=flip_vertical,
+                    rotation_degrees=rotation_degrees,
+                )
+            )
+            candidate_id += 1
+    return transforms
+
+
+def apply_coarse_orientation_transform(
+    source_img: Image.Image,
+    transform: CoarseOrientationTransform,
+) -> Image.Image:
+    aligned = source_img
+    if transform.flip_horizontal:
+        aligned = aligned.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+    if transform.flip_vertical:
+        aligned = aligned.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    if transform.rotation_degrees % 360 != 0:
+        aligned = aligned.rotate(
+            transform.rotation_degrees,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor=_background_fill_color(aligned),
+        )
+    return aligned
+
+
+def enumerate_unique_coarse_orientation_transforms(
+    source_img: Image.Image,
+) -> tuple[list[CoarseOrientationTransform], int]:
+    """Return deduplicated transforms for this source; typically 8 unique orientations."""
+    unique: list[CoarseOrientationTransform] = []
+    seen: set[tuple[tuple[int, int], bytes]] = set()
+    raw_count = 0
+    next_id = 0
+    for rotation_degrees in COARSE_ROTATIONS_DEG:
+        for flip_horizontal, flip_vertical in COARSE_FLIP_MODES:
+            raw_count += 1
+            raw = CoarseOrientationTransform(
+                candidate_id=-1,
+                flip_horizontal=flip_horizontal,
+                flip_vertical=flip_vertical,
+                rotation_degrees=rotation_degrees,
+            )
+            output = apply_coarse_orientation_transform(source_img, raw)
+            key = _coarse_transform_output_key(output)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(
+                CoarseOrientationTransform(
+                    candidate_id=next_id,
+                    flip_horizontal=flip_horizontal,
+                    flip_vertical=flip_vertical,
+                    rotation_degrees=rotation_degrees,
+                )
+            )
+            next_id += 1
+    return unique, raw_count
+
+
+def _thumbnail_on_canvas(image: Image.Image, size: int) -> Image.Image:
+    thumb = image.copy()
+    thumb.thumbnail((size, size), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (size, size), _background_fill_color(image))
+    offset = ((size - thumb.width) // 2, (size - thumb.height) // 2)
+    canvas.paste(thumb, offset)
+    return canvas
+
+
+def build_coarse_candidate_grid(
+    candidates: list[Image.Image],
+    transforms: list[CoarseOrientationTransform],
+    thumb_size: int = 256,
+    columns: int = 4,
+) -> Image.Image:
+    if len(candidates) != len(transforms):
+        raise ValueError("candidates and transforms must have the same length")
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+
+    rows = (len(candidates) + columns - 1) // columns
+    label_height = 28
+    cell_w = thumb_size
+    cell_h = thumb_size + label_height
+    grid = Image.new("RGB", (columns * cell_w, rows * cell_h), (24, 24, 24))
+    draw = ImageDraw.Draw(grid)
+    font = ImageFont.load_default()
+
+    for index, (candidate, transform) in enumerate(zip(candidates, transforms)):
+        row = index // columns
+        col = index % columns
+        x0 = col * cell_w
+        y0 = row * cell_h
+        thumb = _thumbnail_on_canvas(candidate, thumb_size)
+        grid.paste(thumb, (x0, y0))
+        draw.rectangle(
+            [x0, y0 + thumb_size, x0 + cell_w - 1, y0 + cell_h - 1],
+            fill=(12, 12, 12),
+        )
+        draw.text((x0 + 6, y0 + thumb_size + 6), str(transform.candidate_id), fill=(255, 255, 255), font=font)
+    return grid
+
+
+def _format_coarse_candidate_table(transforms: list[CoarseOrientationTransform]) -> str:
+    return "\n".join(f"- {transform.label}" for transform in transforms)
+
+
+def bruteforce_pre_align_source(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    output_dir: Path,
+) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
+    transforms, raw_count = enumerate_unique_coarse_orientation_transforms(source_img)
+    if not transforms:
+        raise RuntimeError("No coarse orientation candidates generated for bruteforce fallback.")
+
+    log(
+        "\n========== Phase -1B: Bruteforce Orientation Fallback "
+        f"({len(transforms)} unique / {raw_count} raw combos) =========="
+    )
+
+    bruteforce_dir = output_dir / "prealign_bruteforce"
+    bruteforce_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates: list[Image.Image] = []
+    candidate_records: list[dict[str, Any]] = []
+    for transform in transforms:
+        candidate = apply_coarse_orientation_transform(source_img, transform)
+        candidates.append(candidate)
+        candidate_path = bruteforce_dir / f"candidate_{transform.candidate_id:02d}.png"
+        save_image(candidate, candidate_path)
+        candidate_records.append(
+            {
+                "candidate_id": transform.candidate_id,
+                "flip_horizontal": transform.flip_horizontal,
+                "flip_vertical": transform.flip_vertical,
+                "rotation_degrees": transform.rotation_degrees,
+                "image_path": str(candidate_path),
+            }
+        )
+
+    grid_columns = 4 if len(transforms) >= 4 else len(transforms)
+    grid = build_coarse_candidate_grid(candidates, transforms, columns=grid_columns)
+    grid_path = bruteforce_dir / "candidate_grid.png"
+    save_image(grid, grid_path)
+
+    max_candidate_id = len(transforms) - 1
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": PREALIGN_BRUTEFORCE_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": grid},
+                {
+                    "type": "text",
+                    "text": f"(IMAGE 1 = CANDIDATE GRID, IDs 0-{max_candidate_id})",
+                },
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {
+                    "type": "text",
+                    "text": PREALIGN_BRUTEFORCE_USER.format(
+                        num_candidates=len(transforms),
+                        max_candidate_id=max_candidate_id,
+                        candidate_table=_format_coarse_candidate_table(transforms),
+                    ),
+                },
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    raw_id = parsed.get("best_candidate_id", 0)
+    try:
+        best_id = int(raw_id)
+    except (TypeError, ValueError):
+        best_id = 0
+    best_id = max(0, min(len(transforms) - 1, best_id))
+    chosen_transform = transforms[best_id]
+    aligned = candidates[best_id]
+
+    decision = PreAlignDecision(
+        should_horizontal_flip=chosen_transform.flip_horizontal,
+        rotation_degrees=float(chosen_transform.rotation_degrees),
+        confidence=1.0,
+        reason=str(parsed.get("reason", "")).strip()
+        or f"Bruteforce fallback selected candidate {best_id}.",
+        applied_horizontal_flip=chosen_transform.flip_horizontal,
+        applied_vertical_flip=chosen_transform.flip_vertical,
+        applied_rotation_degrees=float(chosen_transform.rotation_degrees),
+    )
+    payload = {
+        "mode": "bruteforce_fallback",
+        "num_raw_candidates": raw_count,
+        "num_candidates": len(transforms),
+        "best_candidate_id": best_id,
+        "chosen_transform": asdict(chosen_transform),
+        "candidate_records": candidate_records,
+        "grid_path": str(grid_path),
+        "vlm_response": parsed,
+        "decision": asdict(decision),
+    }
+    (bruteforce_dir / "bruteforce_result.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log(
+        "[prealign] Bruteforce selected "
+        f"candidate {best_id}: flip_h={chosen_transform.flip_horizontal}, "
+        f"flip_v={chosen_transform.flip_vertical}, rotate={chosen_transform.rotation_degrees}°"
+    )
+    return aligned, decision, payload
+
+
 def pre_align_source(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -1485,6 +2141,7 @@ def pre_align_source(
     output_dir: Path,
     min_confidence: float,
     max_rotation: float,
+    retry_feedback: str = "",
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
     log("\n========== Phase -1: Coarse Orientation Pre-Alignment ==========")
     log("[prealign] Selecting a two-landmark axis and comparing source vs target...")
@@ -1503,6 +2160,12 @@ def pre_align_source(
                     "text": PREALIGN_USER.format(
                         min_confidence=min_confidence,
                         max_rotation=max_rotation,
+                    )
+                    + (
+                        "\n\nPrevious pre-align verification failed. Revise the decision.\n"
+                        f"Failure reason: {retry_feedback}"
+                        if retry_feedback
+                        else ""
                     ),
                 },
             ],
@@ -1547,6 +2210,107 @@ def pre_align_source(
     return aligned, decision, parsed
 
 
+def verify_pre_alignment(
+    original_source: Image.Image,
+    aligned_source: Image.Image,
+    target_img: Image.Image,
+    decision: PreAlignDecision,
+    planner_vlm: QwenVLMClient,
+) -> PreAlignVerifyResult:
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": PREALIGN_VERIFY_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": original_source},
+                {"type": "text", "text": "(IMAGE 1 = ORIGINAL SOURCE)"},
+                {"type": "image", "image": aligned_source},
+                {"type": "text", "text": "(IMAGE 2 = ALIGNED SOURCE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 3 = TARGET)"},
+                {
+                    "type": "text",
+                    "text": PREALIGN_VERIFY_USER.format(
+                        decision_json=json.dumps(asdict(decision), indent=2, ensure_ascii=False),
+                    ),
+                },
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    return PreAlignVerifyResult(
+        overall_ok=bool(parsed.get("overall_ok", False)),
+        recommendation=str(parsed.get("recommendation", "retry")).lower(),
+        failure_reason=parsed.get("failure_reason"),
+    )
+
+
+def pre_align_source_until_verified(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    output_dir: Path,
+    min_confidence: float,
+    max_rotation: float,
+    max_attempts: int = 0,
+    bruteforce_after_attempts: int = 5,
+) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
+    attempt = 0
+    feedback = ""
+    retry_cap = max_attempts if max_attempts > 0 else bruteforce_after_attempts
+    while True:
+        attempt += 1
+        log(f"\n[prealign] Verified attempt {attempt}/{retry_cap}")
+        aligned, decision, parsed = pre_align_source(
+            source_img=source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            output_dir=output_dir,
+            min_confidence=min_confidence,
+            max_rotation=max_rotation,
+            retry_feedback=feedback,
+        )
+        if feedback:
+            parsed["retry_feedback"] = feedback
+
+        verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
+        parsed["verify"] = asdict(verify)
+        (output_dir / "pre_alignment.json").write_text(
+            json.dumps(parsed, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if verify.overall_ok and verify.recommendation == "apply":
+            log("[prealign] Verify PASSED; applying aligned source.")
+            return aligned, decision, parsed
+        if verify.overall_ok and verify.recommendation == "rollback":
+            log("[prealign] Verify accepted rollback; using original source.")
+            decision.applied_horizontal_flip = False
+            decision.applied_vertical_flip = False
+            decision.applied_rotation_degrees = 0.0
+            parsed["rolled_back"] = True
+            return source_img, decision, parsed
+
+        feedback = verify.failure_reason or "Pre-align verification failed; choose safer landmarks or skip transform."
+        log(f"[prealign] Verify FAILED: {feedback}")
+        if attempt >= retry_cap:
+            log(
+                f"[prealign] Landmark-based pre-align failed after {attempt} attempt(s); "
+                f"running bruteforce fallback with unique flip/rotate candidates."
+            )
+            aligned, decision, bruteforce_payload = bruteforce_pre_align_source(
+                source_img=source_img,
+                target_img=target_img,
+                planner_vlm=planner_vlm,
+                output_dir=output_dir,
+            )
+            parsed["bruteforce_fallback"] = bruteforce_payload
+            (output_dir / "pre_alignment.json").write_text(
+                json.dumps(parsed, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return aligned, decision, parsed
+
+
 def plan(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -1559,13 +2323,16 @@ def plan(
     t0 = time.time()
     prealign_note = ""
     if pre_alignment is not None and (
-        pre_alignment.applied_horizontal_flip or abs(pre_alignment.applied_rotation_degrees) > 0
+        pre_alignment.applied_horizontal_flip
+        or pre_alignment.applied_vertical_flip
+        or abs(pre_alignment.applied_rotation_degrees) > 0
     ):
         prealign_note = (
             "\n\nPre-alignment already applied to SOURCE before this planning step:\n"
             f"- object_category: {pre_alignment.object_category}\n"
             f"- landmark_axis: {pre_alignment.primary_landmark} -> {pre_alignment.secondary_landmark}\n"
             f"- horizontal_flip: {pre_alignment.applied_horizontal_flip}\n"
+            f"- vertical_flip: {pre_alignment.applied_vertical_flip}\n"
             f"- in_plane_rotation_degrees: {pre_alignment.applied_rotation_degrees:.1f}\n"
             f"- anchor_layout: {pre_alignment.horizontal_layout_match}\n"
             "Comparable landmark pairs were aligned (e.g. head->tail, front->rear). "
@@ -1614,6 +2381,209 @@ def plan(
     return analysis, steps, parsed
 
 
+def diagnose_stage_plan(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    output_dir: Path,
+    max_pose_steps: int,
+    revision_hint: str = "",
+) -> tuple[Analysis, StagePlan, dict[str, Any]]:
+    log("\n========== Phase 0A: Pair Diagnosis ==========")
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": DIAGNOSIS_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": source_img},
+                {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {
+                    "type": "text",
+                    "text": DIAGNOSIS_USER.format(max_pose_steps=max_pose_steps)
+                    + (
+                        "\n\nPrevious planning verification failed. Revise diagnosis/stage plan.\n"
+                        f"Revision hint: {revision_hint}"
+                        if revision_hint
+                        else ""
+                    ),
+                },
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=2048))
+    analysis = build_analysis(parsed)
+    stage_plan = build_stage_plan(parsed, max_pose_steps=max_pose_steps)
+    diagnosis_path = output_dir / "stage_diagnosis.json"
+    diagnosis_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(
+        "[diagnosis] "
+        f"type={stage_plan.object_motion_type}, pose_gap={stage_plan.pose_gap}, "
+        f"pose_steps={stage_plan.pose_steps}, angle_stage={stage_plan.run_angle_stage}"
+    )
+    log(
+        "[diagnosis] camera "
+        f"{stage_plan.source_camera.prompt} -> {stage_plan.target_camera.prompt}"
+    )
+    return analysis, stage_plan, parsed
+
+
+def verify_planning(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    plan_payload: dict[str, Any],
+    planner_vlm: QwenVLMClient,
+) -> dict[str, Any]:
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": PLANNING_VERIFY_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": source_img},
+                {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {
+                    "type": "text",
+                    "text": PLANNING_VERIFY_USER.format(
+                        plan_json=json.dumps(plan_payload, indent=2, ensure_ascii=False),
+                    ),
+                },
+            ],
+        },
+    ]
+    return parse_json(planner_vlm.chat(messages, max_new_tokens=768))
+
+
+def plan_pose_stage(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    diagnosis: dict[str, Any],
+    pose_steps: int,
+    output_dir: Path,
+    revision_hint: str = "",
+) -> tuple[list[SubInstruction], dict[str, Any]]:
+    if pose_steps <= 0:
+        return [], {"steps": []}
+
+    prompt = POSE_PLANNING_USER.format(
+        diagnosis_json=json.dumps(diagnosis, indent=2, ensure_ascii=False),
+        pose_steps=pose_steps,
+    )
+    if revision_hint:
+        prompt += (
+            "\n\nPrevious planning verification failed. Revise the pose plan.\n"
+            f"Revision hint: {revision_hint}"
+        )
+
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": POSE_PLANNING_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": source_img},
+                {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=2048))
+    raw_steps = parsed.get("steps", [])
+    steps = [build_step(step, idx + 1) for idx, step in enumerate(raw_steps)]
+    if len(steps) != pose_steps:
+        raise ValueError(f"Pose planner returned {len(steps)} steps, expected {pose_steps}.")
+    return steps, parsed
+
+
+def build_stage_plan_payload(
+    analysis: Analysis,
+    stage_plan: StagePlan,
+    pose_steps: list[SubInstruction],
+    angle_steps: list[SubInstruction],
+    diagnosis: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "analysis": asdict(analysis),
+        "stage_plan": asdict(stage_plan),
+        "diagnosis": diagnosis,
+        "pose_steps": [asdict(step) for step in pose_steps],
+        "angle_steps": [asdict(step) for step in angle_steps],
+        "steps": [asdict(step) for step in pose_steps + angle_steps],
+    }
+
+
+def plan_staged_until_verified(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    output_dir: Path,
+    max_pose_steps: int,
+    max_planning_attempts: int,
+) -> tuple[Analysis, StagePlan, list[SubInstruction], dict[str, Any], dict[str, Any]]:
+    attempt = 0
+    revision_hint = ""
+    last_verify: dict[str, Any] = {}
+    while True:
+        attempt += 1
+        log(f"\n[plan] Verified staged planning attempt {attempt}")
+        analysis, stage_plan, diagnosis = diagnose_stage_plan(
+            source_img=source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            output_dir=output_dir,
+            max_pose_steps=max_pose_steps,
+            revision_hint=revision_hint,
+        )
+        pose_steps, pose_raw = plan_pose_stage(
+            source_img=source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            diagnosis=diagnosis,
+            pose_steps=stage_plan.pose_steps,
+            output_dir=output_dir,
+            revision_hint=revision_hint,
+        )
+        angle_steps = generate_angle_steps(stage_plan, start_step=len(pose_steps) + 1)
+        all_steps = pose_steps + angle_steps
+        for idx, step in enumerate(all_steps, start=1):
+            step.step = idx
+            if all_steps:
+                step.cumulative_progress = max(step.cumulative_progress, idx / len(all_steps))
+
+        plan_payload = build_stage_plan_payload(
+            analysis=analysis,
+            stage_plan=stage_plan,
+            pose_steps=pose_steps,
+            angle_steps=angle_steps,
+            diagnosis=diagnosis,
+        )
+        plan_payload["pose_raw"] = pose_raw
+        plan_payload["planning_attempt"] = attempt
+        last_verify = verify_planning(source_img, target_img, plan_payload, planner_vlm)
+        plan_payload["planning_verify"] = last_verify
+
+        plan_path = output_dir / "plan.json"
+        plan_path.write_text(json.dumps(plan_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        log(f"[plan] Wrote {plan_path}")
+
+        if bool(last_verify.get("overall_ok", False)):
+            log("[plan] Verify PASSED")
+            return analysis, stage_plan, all_steps, plan_payload, last_verify
+
+        revision_hint = str(
+            last_verify.get("revision_hint")
+            or last_verify.get("failure_reason")
+            or "Planning verification failed; revise stage ordering and prompt formats."
+        )
+        log(f"[plan] Verify FAILED: {revision_hint}")
+        if max_planning_attempts > 0 and attempt >= max_planning_attempts:
+            raise RuntimeError(f"Planning verification failed after {attempt} attempts: {revision_hint}")
+
+
 def vlm_verify(
     before: Image.Image,
     after: Image.Image,
@@ -1623,7 +2593,7 @@ def vlm_verify(
     shared_parts: Optional[list[str]] = None,
 ) -> VLMVerifyResult:
     shared_parts = shared_parts or []
-    num_questions = 7 if shared_parts else 6
+    num_questions = 6 if shared_parts else 5
     messages = [
         {"role": "system", "content": [{"type": "text", "text": VERIFY_SYSTEM}]},
         {
@@ -1648,14 +2618,13 @@ def vlm_verify(
         },
     ]
     answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128), num_questions=num_questions)
-    shared_parts_visible = answers.get(7, True) if shared_parts else True
+    shared_parts_visible = answers.get(6, True) if shared_parts else True
     return VLMVerifyResult(
         geometric_change_applied=answers.get(1, False),
         identity_preserved=answers.get(2, False),
-        background_unchanged=answers.get(3, False),
-        physically_plausible=answers.get(4, False),
-        no_artifacts=answers.get(5, False),
-        closer_to_target=answers.get(6, False),
+        physically_plausible=answers.get(3, False),
+        no_artifacts=answers.get(4, False),
+        closer_to_target=answers.get(5, False),
         shared_parts_visible=shared_parts_visible,
     )
 
@@ -1778,21 +2747,6 @@ def check_rotation_flow(flow: np.ndarray, motion_mask: np.ndarray, expected_chan
     else:
         direction_ok = abs(mean_cross) > 0
     return direction_ok, check_magnitude_in_range(roi_flow)
-
-
-def check_background_preservation(before: Image.Image, after: Image.Image, border: float = 0.08) -> bool:
-    before_arr = np.asarray(before.convert("RGB"), dtype=np.float32)
-    after_arr = np.asarray(after.resize(before.size, Image.Resampling.BICUBIC).convert("RGB"), dtype=np.float32)
-    height, width = before_arr.shape[:2]
-    band_h = max(1, int(height * border))
-    band_w = max(1, int(width * border))
-    mask = np.zeros((height, width), dtype=bool)
-    mask[:band_h, :] = True
-    mask[-band_h:, :] = True
-    mask[:, :band_w] = True
-    mask[:, -band_w:] = True
-    mse = ((before_arr[mask] - after_arr[mask]) ** 2).mean()
-    return float(mse) < 250.0
 
 
 def check_silhouette_direction(
@@ -2104,7 +3058,7 @@ def verify_edit(
     check_flow_roi = False
     check_flow_rotation = False
 
-    if step.transform_type in {"viewpoint_azimuth", "viewpoint_elevation"}:
+    if step.transform_type in {"viewpoint_azimuth", "viewpoint_elevation", "angle_size"}:
         identity_threshold = 0.60
         skip_flow_direction = True
     elif step.transform_type == "inplane_rotation":
@@ -2164,7 +3118,6 @@ def verify_edit(
         )
     texture_ok = True
     silhouette_ok = True
-    background_ok = check_background_preservation(before, after)
 
     if step.identity_warning == "check_texture":
         texture_score = identity_scorer.patch_similarity(before, after)
@@ -2197,7 +3150,6 @@ def verify_edit(
             texture_ok=texture_ok,
             silhouette_ok=silhouette_ok,
             semantic_ok=False,
-            background_ok=background_ok,
             shared_parts_ok=True,
             overall_ok=False,
             failure_reason="; ".join(objective_failures),
@@ -2213,7 +3165,6 @@ def verify_edit(
             texture_ok=texture_ok,
             silhouette_ok=silhouette_ok,
             semantic_ok=True,
-            background_ok=background_ok,
             shared_parts_ok=True,
             overall_ok=True,
             failure_reason=None,
@@ -2232,13 +3183,11 @@ def verify_edit(
             "    [verify] VLM: "
             f"geometry={vlm_result.geometric_change_applied}, "
             f"identity={vlm_result.identity_preserved}, "
-            f"background={vlm_result.background_unchanged} (non-blocking), "
             f"shared_parts={vlm_result.shared_parts_visible}, "
             f"plausible={vlm_result.physically_plausible}, "
             f"artifacts_free={vlm_result.no_artifacts}, "
             f"closer_to_target={vlm_result.closer_to_target}"
         )
-    background_ok = background_ok and vlm_result.background_unchanged
     shared_parts_ok = vlm_result.shared_parts_visible if shared_parts else True
     overall = (
         flow_direction_ok
@@ -2282,7 +3231,6 @@ def verify_edit(
         texture_ok=texture_ok,
         silhouette_ok=silhouette_ok,
         semantic_ok=vlm_result.geometric_change_applied,
-        background_ok=background_ok,
         shared_parts_ok=shared_parts_ok,
         overall_ok=overall,
         failure_reason=failure_reason,
@@ -2316,10 +3264,12 @@ def execute_one_step(
         )
         t_edit = time.time()
         log("  editing with MotionNFT...")
+        adapter = "angle" if current_step.transform_type == "angle_size" else "motion"
         edited = editor.edit(
             source_img=before,
             instruction=current_step.instruction,
             step_seed=step_idx * 100 + retry_count,
+            adapter=adapter,
         )
         log(f"  edit done in {time.time() - t_edit:.1f}s")
         retry_name = f"step_{step_idx:02d}{attempt_prefix}_retry_{retry_count}.png"
@@ -2349,6 +3299,10 @@ def execute_one_step(
         if retry_count >= max_retries:
             log(f"[step {step_idx}] max retries reached; keeping last attempt")
             break
+        if current_step.transform_type == "angle_size":
+            log("[replan] Angle-LoRA step keeps fixed <sks> prompt; retrying with next seed.")
+            retry_count += 1
+            continue
         if planner_vlm is None:
             raise ValueError("Replanning requires planner_vlm.")
         current_step = replan(
@@ -2612,31 +3566,43 @@ def progressive_pose_edit(
     pre_alignment: Optional[PreAlignDecision] = None,
     skip_trajectory_repair: bool = False,
     max_trajectory_repairs: int = 2,
+    max_pose_steps: int = 6,
+    max_planning_attempts: int = 0,
 ) -> PipelineResult:
-    log("\n========== Phase 0: Planning ==========")
-    analysis, steps, raw_plan = plan(
-        source_img,
-        target_img,
-        planner_vlm,
-        n_steps,
-        output_dir=output_dir,
-        pre_alignment=pre_alignment,
-    )
-    log("\n========== Phase 1: Progressive Execution ==========")
-    trajectory, final_steps, verify_results = execute_progressive(
+    log("\n========== Phase 0: Staged Planning ==========")
+    analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
         source_img=source_img,
         target_img=target_img,
-        steps=steps,
-        editor=editor,
-        flow_estimator=flow_estimator,
-        identity_scorer=identity_scorer,
         planner_vlm=planner_vlm,
-        max_retries=max_retries,
-        flow_threshold=flow_threshold,
-        skip_vlm_verify=skip_vlm_verify,
         output_dir=output_dir,
-        shared_parts=analysis.shared_parts,
+        max_pose_steps=max_pose_steps,
+        max_planning_attempts=max_planning_attempts,
     )
+
+    log("\n========== Phase 1: Progressive Execution (Pose -> Angle/Size) ==========")
+    if not steps:
+        log("[execute] No pose or angle/size edits needed; keeping source as final.")
+        trajectory = [source_img]
+        final_steps = []
+        verify_results = []
+    else:
+        for step in steps:
+            log(f"  staged step {step.step}/{len(steps)} [{step.transform_type}] {step.instruction}")
+        trajectory, final_steps, verify_results = execute_progressive(
+            source_img=source_img,
+            target_img=target_img,
+            steps=steps,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            planner_vlm=planner_vlm,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            output_dir=output_dir,
+            shared_parts=analysis.shared_parts,
+        )
+
     log("\n========== Phase 1.5: Trajectory Verify ==========")
     trajectory_verify = verify_trajectory(
         trajectory=trajectory,
@@ -2694,6 +3660,8 @@ def progressive_pose_edit(
         verify_results=verify_results,
         final_img=trajectory[-1],
         pre_alignment=pre_alignment,
+        stage_plan=stage_plan,
+        planning_verify=planning_verify,
         trajectory_verify=trajectory_verify,
         trajectory_repair=trajectory_repair,
     )
@@ -2707,6 +3675,7 @@ def progressive_pose_edit(
 def validate_pretrained_paths(
     editor_base_model: str,
     motionedit_lora_path: str,
+    qwen_angles_lora_path: str,
     planner_vlm: str,
     dinov2_model: str,
     unimatch_ckpt: str,
@@ -2720,6 +3689,11 @@ def validate_pretrained_paths(
         (
             "motionedit_lora",
             Path(motionedit_lora_path) / MOTIONEDIT_LORA_WEIGHT,
+            False,
+        ),
+        (
+            "qwen_angles_lora",
+            Path(qwen_angles_lora_path) / ANGLE_LORA_WEIGHT,
             False,
         ),
     ]
@@ -2757,6 +3731,11 @@ def parse_args() -> argparse.Namespace:
         "--motionedit_lora_path",
         default=str(DEFAULT_MOTIONEDIT_LORA_PATH),
         help="MotionEdit LoRA directory (default: .../motionedit_vlm/motionedit-lora).",
+    )
+    parser.add_argument(
+        "--qwen_angles_lora_path",
+        default=str(DEFAULT_QWEN_ANGLES_LORA_PATH),
+        help="Qwen Image Edit multi-angle LoRA directory.",
     )
     parser.add_argument(
         "--planner_vlm",
@@ -2828,6 +3807,36 @@ def parse_args() -> argparse.Namespace:
         help="Maximum absolute in-plane pre-alignment rotation in degrees.",
     )
     parser.add_argument(
+        "--max_prealign_verify_attempts",
+        type=int,
+        default=0,
+        help=(
+            "Max landmark-based pre-align verify retries before bruteforce fallback; "
+            "0 uses --prealign_bruteforce_after_attempts (default 5)."
+        ),
+    )
+    parser.add_argument(
+        "--prealign_bruteforce_after_attempts",
+        type=int,
+        default=5,
+        help=(
+            "After this many failed pre-align verify attempts, enumerate unique flip/rotate "
+            "candidates (typically 8) and let the VLM pick the closest to TARGET."
+        ),
+    )
+    parser.add_argument(
+        "--max_pose_steps",
+        type=int,
+        default=6,
+        help="Maximum MotionEdit pose/deformation steps from staged diagnosis.",
+    )
+    parser.add_argument(
+        "--max_planning_attempts",
+        type=int,
+        default=0,
+        help="Retry planning until verified; 0 means unlimited.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable verbose progress logs (tqdm bar still shown).",
@@ -2854,6 +3863,8 @@ def trajectory_verify_to_dict(result: Optional[TrajectoryVerifyResult]) -> Optio
 def serializable_result(result: PipelineResult) -> dict[str, Any]:
     return {
         "pre_alignment": asdict(result.pre_alignment) if result.pre_alignment is not None else None,
+        "stage_plan": asdict(result.stage_plan) if result.stage_plan is not None else None,
+        "planning_verify": result.planning_verify,
         "analysis": asdict(result.analysis),
         "instructions": [asdict(step) for step in result.instructions],
         "verify_results": [asdict(verify) for verify in result.verify_results],
@@ -2884,6 +3895,7 @@ def main() -> None:
         validate_pretrained_paths(
             editor_base_model=args.editor_base_model,
             motionedit_lora_path=args.motionedit_lora_path,
+            qwen_angles_lora_path=args.qwen_angles_lora_path,
             planner_vlm=args.planner_vlm,
             dinov2_model=args.dinov2_model,
             unimatch_ckpt=args.unimatch_ckpt,
@@ -2892,6 +3904,7 @@ def main() -> None:
     log("\n[models] Using pretrained paths:")
     log(f"  editor_base_model     = {args.editor_base_model}")
     log(f"  motionedit_lora_path  = {args.motionedit_lora_path}")
+    log(f"  qwen_angles_lora_path = {args.qwen_angles_lora_path}")
     log(f"  planner_vlm           = {args.planner_vlm}")
     log(f"  dinov2_model          = {args.dinov2_model}")
     log(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
@@ -2922,13 +3935,15 @@ def main() -> None:
         log("\n[prealign] Skipped (--skip_pre_align)")
         save_image(aligned_source_img, output_dir / "step_00.png")
     else:
-        aligned_source_img, pre_alignment, _ = pre_align_source(
+        aligned_source_img, pre_alignment, _ = pre_align_source_until_verified(
             source_img=source_img,
             target_img=target_img,
             planner_vlm=planner_vlm,
             output_dir=output_dir,
             min_confidence=args.pre_align_min_confidence,
             max_rotation=args.max_pre_align_rotation,
+            max_attempts=args.max_prealign_verify_attempts,
+            bruteforce_after_attempts=args.prealign_bruteforce_after_attempts,
         )
         save_image(aligned_source_img, output_dir / "aligned_source.png")
         save_image(aligned_source_img, output_dir / "step_00.png")
@@ -2938,6 +3953,7 @@ def main() -> None:
     editor = MotionNFTEditor(
         base_model=args.editor_base_model,
         lora_path=args.motionedit_lora_path,
+        angle_lora_path=args.qwen_angles_lora_path,
         device=args.device,
         device_map=args.editor_device_map,
         dtype=dtype,
@@ -2980,6 +3996,8 @@ def main() -> None:
         pre_alignment=pre_alignment,
         skip_trajectory_repair=args.skip_trajectory_repair,
         max_trajectory_repairs=args.max_trajectory_repairs,
+        max_pose_steps=args.max_pose_steps,
+        max_planning_attempts=args.max_planning_attempts,
     )
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
 

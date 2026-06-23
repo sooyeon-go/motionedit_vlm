@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -93,6 +94,43 @@ def iter_pair_annotation_files(
         if not split_dir.is_dir():
             raise FileNotFoundError(f"PairAnnotation split not found: {split_dir}")
         yield from sorted(split_dir.glob("*.json"))
+
+
+def _pair_sort_key(pair: SpairPair) -> tuple[int, str]:
+    return (pair.pair_id if pair.pair_id >= 0 else 10**9, pair.filename)
+
+
+def interleave_pairs_by_category(pairs: list[SpairPair]) -> list[SpairPair]:
+    """Round-robin across categories within each split.
+
+    Instead of processing all aeroplane pairs then all bicycle pairs, emit one
+    pair per category in rotation: aeroplane[0], bicycle[0], bus[0], ...,
+  aeroplane[1], bicycle[1], ...
+    """
+    if not pairs:
+        return []
+
+    by_split: dict[str, list[SpairPair]] = defaultdict(list)
+    for pair in pairs:
+        by_split[pair.split].append(pair)
+
+    ordered: list[SpairPair] = []
+    for split in normalize_splits(by_split):
+        by_category: dict[str, list[SpairPair]] = defaultdict(list)
+        for pair in by_split[split]:
+            by_category[pair.category].append(pair)
+
+        categories = sorted(by_category)
+        for category in categories:
+            by_category[category].sort(key=_pair_sort_key)
+
+        max_len = max((len(by_category[category]) for category in categories), default=0)
+        for index in range(max_len):
+            for category in categories:
+                category_pairs = by_category[category]
+                if index < len(category_pairs):
+                    ordered.append(category_pairs[index])
+    return ordered
 
 
 def shard_items(items: list[SpairPair], worker_id: int, num_workers: int) -> list[SpairPair]:
