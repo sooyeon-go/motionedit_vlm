@@ -25,7 +25,7 @@ cd "${REPO_ROOT}"
 
 GPU_IDS="${GPU_IDS:-0}"
 DATASET_ROOT="${DATASET_ROOT:-/data/shared-vilab/datasets/spair-71k/SPair-71k}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit_newver}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit_sgoal}"
 # Processed in fixed order: test -> val -> trn (train), regardless of list order here.
 SPLITS="${SPLITS:-test,val,trn}"
 N_STEPS="${N_STEPS:-5}"
@@ -35,6 +35,9 @@ MAX_PREALIGN_VERIFY_ATTEMPTS="${MAX_PREALIGN_VERIFY_ATTEMPTS:-0}"
 PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS="${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS:-5}"
 MAX_PLANNING_ATTEMPTS="${MAX_PLANNING_ATTEMPTS:-0}"
 MAX_POSE_STEPS="${MAX_POSE_STEPS:-6}"
+SKIP_S_GOAL="${SKIP_S_GOAL:-0}"
+S_GOAL_MAX_RETRIES="${S_GOAL_MAX_RETRIES:-2}"
+S_GOAL_IDENTITY_THRESHOLD="${S_GOAL_IDENTITY_THRESHOLD:-0.72}"
 LIMIT="${LIMIT:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 INTERLEAVE_CLASSES="${INTERLEAVE_CLASSES:-1}"
@@ -75,6 +78,9 @@ echo "[run_spair71k] prealign_verify_attempts = ${MAX_PREALIGN_VERIFY_ATTEMPTS} 
 echo "[run_spair71k] prealign_bruteforce_after = ${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS} (unique flip/rotate VLM pick, typically 8)"
 echo "[run_spair71k] planning_attempts        = ${MAX_PLANNING_ATTEMPTS} (0=unlimited)"
 echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
+echo "[run_spair71k] skip_s_goal              = ${SKIP_S_GOAL} (0=S_goal first, 1=direct target path)"
+echo "[run_spair71k] s_goal_max_retries       = ${S_GOAL_MAX_RETRIES}"
+echo "[run_spair71k] s_goal_identity_threshold= ${S_GOAL_IDENTITY_THRESHOLD}"
 echo "[run_spair71k] log_to_file              = ${LOG_TO_FILE} (0=terminal only, 1=terminal+logs)"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
@@ -113,6 +119,8 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     --prealign_bruteforce_after_attempts "${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS}"
     --max_planning_attempts "${MAX_PLANNING_ATTEMPTS}"
     --max_pose_steps "${MAX_POSE_STEPS}"
+    --s_goal_max_retries "${S_GOAL_MAX_RETRIES}"
+    --s_goal_identity_threshold "${S_GOAL_IDENTITY_THRESHOLD}"
     --device cuda
   )
 
@@ -131,6 +139,9 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
   fi
   if [[ "${DRY_RUN}" == "1" ]]; then
     CMD+=(--dry_run)
+  fi
+  if [[ "${SKIP_S_GOAL}" == "1" ]]; then
+    CMD+=(--skip_s_goal)
   fi
   if [[ -n "${EXTRA_ARGS}" ]]; then
     # shellcheck disable=SC2206

@@ -168,6 +168,9 @@ def run_single_pair(
         max_trajectory_repairs=args.max_trajectory_repairs,
         max_pose_steps=args.max_pose_steps,
         max_planning_attempts=args.max_planning_attempts,
+        skip_s_goal=args.skip_s_goal,
+        s_goal_max_retries=args.s_goal_max_retries,
+        s_goal_identity_threshold=args.s_goal_identity_threshold,
     )
 
     ppe.save_image(result.final_img, output_dir / "final.png")
@@ -296,6 +299,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prealign_bruteforce_after_attempts", type=int, default=5)
     parser.add_argument("--max_pose_steps", type=int, default=6)
     parser.add_argument("--max_planning_attempts", type=int, default=0)
+    parser.add_argument("--skip_s_goal", action="store_true")
+    parser.add_argument("--s_goal_max_retries", type=int, default=2)
+    parser.add_argument("--s_goal_identity_threshold", type=float, default=0.72)
     parser.add_argument("--quiet", action="store_true")
     return parser
 

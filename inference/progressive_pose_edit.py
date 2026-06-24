@@ -189,7 +189,7 @@ Rules:
   - rotation_degrees: derived from primary→secondary axis angle difference.
     Positive = counterclockwise. Keep within -{max_rotation} to {max_rotation}.
   - If either landmark is missing/unclear, set confidence below {min_confidence} and skip transforms.
-  - Ignore background; focus on the two object landmarks.
+  - Focus only on the two object landmarks.
   - Cross-category pairs: map analogous parts (cat head ↔ dog head, car front ↔ car front)."""
 
 PLANNING_SYSTEM = """You are an expert visual geometry analyst and image editing planner.
@@ -211,7 +211,6 @@ Key principle:
   You are NOT replacing the source object with the target.
   You are ONLY changing its geometric configuration.
   The source object must remain exactly what it is.
-  Background is irrelevant — never evaluate, preserve, or mention background.
 
 Output valid JSON only. No prose, no markdown fences outside JSON."""
 
@@ -321,7 +320,6 @@ INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
   - ALL shared_parts must remain clearly visible after this step (never remove or hide them)
-  - Background is irrelevant; do not plan for or mention background preservation
   - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
   - Do NOT plan coarse whole-object rotation unless fixing a small residual tilt
   - Use identifiable parts in instructions (head, tail, paws, wheels, hands, etc.)
@@ -403,7 +401,6 @@ Important: IMAGE 3 is only a geometry/pose reference. Do not require the edited
 object to adopt the TARGET object's identity, category, texture, color, or material.
 The edited object must preserve the SOURCE identity and only move closer to TARGET
 geometry/configuration.
-Background is completely irrelevant. Do not evaluate, preserve, or mention background.
 
 This step's instruction: "{instruction}"
 Transform type: {transform_type}
@@ -494,6 +491,55 @@ Rules:
 - best_candidate_id must be an integer in [0, {max_candidate_id}].
 - Prefer the candidate that would need the smallest later pose edit to reach TARGET."""
 
+SGOAL_EDIT_PROMPT = """Edit IMAGE 1 so that its object matches IMAGE 2's pose, camera view, scale, and visible part layout.
+
+Hard requirements:
+- Preserve IMAGE 1 object's identity, category, texture, color, material, and surface details.
+- Use IMAGE 2 only as geometry reference for pose, camera angle, size/framing, and visible part layout.
+- Do NOT copy IMAGE 2 object's identity, texture, color, material, or category-specific appearance.
+- It is okay if parts visible in IMAGE 1 become occluded when that matches IMAGE 2's visible geometry.
+
+Return a single edited version of IMAGE 1."""
+
+SGOAL_VERIFY_SYSTEM = """You are a strict verifier for a source-identity goal image.
+Answer with valid JSON only."""
+
+SGOAL_VERIFY_USER = """Images:
+IMAGE 1 = PRE-ALIGNED SOURCE
+IMAGE 2 = S_GOAL candidate, edited from IMAGE 1
+IMAGE 3 = TARGET geometry reference
+
+Goal:
+Decide whether IMAGE 2 is a good endpoint for later progressive editing from IMAGE 1.
+IMAGE 2 should preserve IMAGE 1 identity while matching IMAGE 3 geometry.
+
+Objective identity score DINO(IMAGE 1, IMAGE 2): {identity_score:.3f}
+Required minimum identity score: {identity_threshold:.3f}
+
+Return this exact JSON:
+{{
+  "overall_ok": true,
+  "pose_match": true,
+  "camera_match": true,
+  "scale_match": true,
+  "identity_preserved": true,
+  "not_target_copy": true,
+  "target_visible_layout_match": true,
+  "no_severe_artifacts": true,
+  "recommendation": "use_as_goal | retry | fallback_to_target_path",
+  "failure_reason": "short reason if not overall_ok"
+}}
+
+Rules:
+- pose_match: IMAGE 2 object articulation/part layout should resemble TARGET geometry.
+- camera_match: IMAGE 2 should resemble TARGET viewpoint/azimuth/elevation.
+- scale_match: IMAGE 2 should resemble TARGET object scale/framing.
+- identity_preserved: IMAGE 2 should still look like IMAGE 1's object.
+- not_target_copy: IMAGE 2 must not copy TARGET identity/texture/material/category appearance.
+- target_visible_layout_match: parts visible in TARGET should be visible and arranged similarly in IMAGE 2.
+- Do not force IMAGE 1-only parts to remain visible if TARGET naturally occludes them.
+- overall_ok=true only if all hard checks are true and identity score is above threshold."""
+
 PLANNING_VERIFY_SYSTEM = """You are a strict editing-plan auditor.
 Answer with valid JSON only."""
 
@@ -520,7 +566,6 @@ Required policy:
 - Every step must preserve source identity/category/texture/material.
 - Shared parts must remain visible.
 - The plan must not copy target identity.
-- Background is irrelevant; do not audit or mention background.
 
 Return this exact JSON:
 {{
@@ -548,7 +593,6 @@ Decide whether to run:
 2) a Qwen angle-LoRA camera/size stage.
 
 Use only visible image evidence. Do not use dataset annotations.
-Background differences between SOURCE and TARGET are irrelevant.
 
 Camera prompt vocabulary:
 - azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
@@ -620,7 +664,6 @@ Stage diagnosis:
 Produce exactly {pose_steps} MotionEdit pose/deformation steps.
 These steps are for pose, articulation, deformation, and part layout only.
 Do NOT include camera viewpoint, angle-LoRA prompts, close-up/medium/wide shot, or size/framing changes.
-Background is irrelevant; do not mention or preserve background.
 
 Instruction style:
 - Natural descriptive edit prompt.
@@ -695,7 +738,6 @@ CRITICAL:
     throughout every keyframe. Never expect it to look like the TARGET object.
   - Judge only whether SOURCE geometry — pose, size, rotation/orientation, and analogous
     part layout — progressively moves toward the TARGET's pose, size, and rotation.
-  - Background is irrelevant; do not evaluate or mention background.
 
 These are sparse intermediate keyframes (not a dense video). Small jumps between
 consecutive keyframes are OK. Flag sudden geometry reversals or part disappearances."""
@@ -765,6 +807,22 @@ class PreAlignDecision:
 class PreAlignVerifyResult:
     overall_ok: bool
     recommendation: str
+    failure_reason: Optional[str] = None
+
+
+@dataclass
+class SGoalVerifyResult:
+    overall_ok: bool
+    pose_match: bool
+    camera_match: bool
+    scale_match: bool
+    identity_preserved: bool
+    not_target_copy: bool
+    target_visible_layout_match: bool
+    no_severe_artifacts: bool
+    recommendation: str
+    identity_score: float
+    identity_threshold: float
     failure_reason: Optional[str] = None
 
 
@@ -874,6 +932,7 @@ class PipelineResult:
     verify_results: list[VerifyResult]
     final_img: Image.Image
     pre_alignment: Optional[PreAlignDecision] = None
+    s_goal: Optional[dict[str, Any]] = None
     stage_plan: Optional[StagePlan] = None
     planning_verify: Optional[dict[str, Any]] = None
     trajectory_verify: Optional[TrajectoryVerifyResult] = None
@@ -1341,6 +1400,16 @@ class MotionNFTEditor:
 
         self.pipe.set_adapters(["motion"], adapter_weights=[1.0])
 
+    def _enable_lora_adapters(self) -> None:
+        if hasattr(self.pipe, "enable_lora"):
+            self.pipe.enable_lora()
+
+    def _disable_lora_adapters(self) -> None:
+        if hasattr(self.pipe, "disable_lora"):
+            self.pipe.disable_lora()
+        else:
+            log("[edit] Pipeline has no disable_lora(); base-only S_goal may still use loaded adapters.")
+
     @torch.no_grad()
     def edit(
         self,
@@ -1353,6 +1422,7 @@ class MotionNFTEditor:
             if adapter == "angle":
                 log("[edit] Angle adapter unavailable; falling back to motion adapter.")
             adapter = "motion"
+        self._enable_lora_adapters()
         self.pipe.set_adapters([adapter], adapter_weights=[1.0])
         generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
         generator = torch.Generator(device=generator_device).manual_seed(self.seed + step_seed)
@@ -1365,6 +1435,33 @@ class MotionNFTEditor:
             guidance_scale=self.guidance_scale,
             generator=generator,
         ).images[0]
+        return image.convert("RGB")
+
+    @torch.no_grad()
+    def edit_s_goal_base(
+        self,
+        source_img: Image.Image,
+        target_img: Image.Image,
+        instruction: str,
+        step_seed: int,
+    ) -> Image.Image:
+        """Generate S_goal from [source, target] with base Qwen Edit Plus only."""
+        generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
+        generator = torch.Generator(device=generator_device).manual_seed(self.seed + step_seed)
+        self._disable_lora_adapters()
+        try:
+            image = self.pipe(
+                num_inference_steps=self.num_inference_steps,
+                image=[source_img, target_img],
+                prompt=instruction,
+                negative_prompt=" ",
+                true_cfg_scale=self.true_cfg_scale,
+                guidance_scale=self.guidance_scale,
+                generator=generator,
+            ).images[0]
+        finally:
+            self._enable_lora_adapters()
+            self.pipe.set_adapters(["motion"], adapter_weights=[1.0])
         return image.convert("RGB")
 
 
@@ -2309,6 +2406,169 @@ def pre_align_source_until_verified(
                 encoding="utf-8",
             )
             return aligned, decision, parsed
+
+
+def verify_s_goal_image(
+    source_img: Image.Image,
+    s_goal_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    identity_scorer: DINOv2IdentityScorer,
+    identity_threshold: float = 0.72,
+) -> SGoalVerifyResult:
+    identity_score = identity_scorer.similarity(source_img, s_goal_img)
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": SGOAL_VERIFY_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": source_img},
+                {"type": "text", "text": "(IMAGE 1 = PRE-ALIGNED SOURCE)"},
+                {"type": "image", "image": s_goal_img},
+                {"type": "text", "text": "(IMAGE 2 = S_GOAL CANDIDATE)"},
+                {"type": "image", "image": target_img},
+                {"type": "text", "text": "(IMAGE 3 = TARGET GEOMETRY REFERENCE)"},
+                {
+                    "type": "text",
+                    "text": SGOAL_VERIFY_USER.format(
+                        identity_score=identity_score,
+                        identity_threshold=identity_threshold,
+                    ),
+                },
+            ],
+        },
+    ]
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    hard_checks = {
+        "pose_match": bool(parsed.get("pose_match", False)),
+        "camera_match": bool(parsed.get("camera_match", False)),
+        "scale_match": bool(parsed.get("scale_match", False)),
+        "identity_preserved": bool(parsed.get("identity_preserved", False)),
+        "not_target_copy": bool(parsed.get("not_target_copy", False)),
+        "target_visible_layout_match": bool(parsed.get("target_visible_layout_match", False)),
+        "no_severe_artifacts": bool(parsed.get("no_severe_artifacts", False)),
+    }
+    overall_ok = (
+        bool(parsed.get("overall_ok", False))
+        and identity_score >= identity_threshold
+        and all(hard_checks.values())
+    )
+    failure_reason = parsed.get("failure_reason")
+    if not overall_ok and not failure_reason:
+        failed = [name for name, ok in hard_checks.items() if not ok]
+        if identity_score < identity_threshold:
+            failed.append(f"identity_score_below_threshold:{identity_score:.3f}")
+        failure_reason = ", ".join(failed) or "S_goal verification failed"
+    recommendation = str(
+        parsed.get("recommendation", "use_as_goal" if overall_ok else "retry")
+    ).lower()
+    return SGoalVerifyResult(
+        overall_ok=overall_ok,
+        pose_match=hard_checks["pose_match"],
+        camera_match=hard_checks["camera_match"],
+        scale_match=hard_checks["scale_match"],
+        identity_preserved=hard_checks["identity_preserved"],
+        not_target_copy=hard_checks["not_target_copy"],
+        target_visible_layout_match=hard_checks["target_visible_layout_match"],
+        no_severe_artifacts=hard_checks["no_severe_artifacts"],
+        recommendation=recommendation,
+        identity_score=float(identity_score),
+        identity_threshold=identity_threshold,
+        failure_reason=failure_reason,
+    )
+
+
+def generate_s_goal_until_verified(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    editor: MotionNFTEditor,
+    planner_vlm: QwenVLMClient,
+    identity_scorer: DINOv2IdentityScorer,
+    output_dir: Path,
+    max_retries: int = 2,
+    identity_threshold: float = 0.72,
+) -> tuple[Optional[Image.Image], dict[str, Any]]:
+    log("\n========== Phase -0.5: S_goal One-Shot Generation (Base Qwen Edit Plus) ==========")
+    attempts: list[dict[str, Any]] = []
+    last_img: Optional[Image.Image] = None
+    last_verify: Optional[SGoalVerifyResult] = None
+    max_attempts = max(1, max_retries + 1)
+
+    for attempt_idx in range(1, max_attempts + 1):
+        log(f"[s_goal] Attempt {attempt_idx}/{max_attempts} with base Qwen Edit Plus")
+        t0 = time.time()
+        prompt = SGOAL_EDIT_PROMPT
+        if last_verify is not None and last_verify.failure_reason:
+            prompt += (
+                "\n\nPrevious S_goal verification failed. Correct this issue while preserving SOURCE identity:\n"
+                f"{last_verify.failure_reason}"
+            )
+        s_goal_img = editor.edit_s_goal_base(
+            source_img=source_img,
+            target_img=target_img,
+            instruction=prompt,
+            step_seed=90000 + attempt_idx,
+        )
+        last_img = s_goal_img
+        candidate_path = output_dir / f"s_goal_attempt_{attempt_idx:02d}.png"
+        save_image(s_goal_img, candidate_path)
+
+        verify = verify_s_goal_image(
+            source_img=source_img,
+            s_goal_img=s_goal_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            identity_scorer=identity_scorer,
+            identity_threshold=identity_threshold,
+        )
+        last_verify = verify
+        attempt_record = {
+            "attempt": attempt_idx,
+            "image_path": str(candidate_path),
+            "elapsed_sec": round(time.time() - t0, 2),
+            "verify": asdict(verify),
+        }
+        attempts.append(attempt_record)
+        log(
+            f"[s_goal] Verify overall_ok={verify.overall_ok}, "
+            f"identity={verify.identity_score:.3f}, recommendation={verify.recommendation}"
+        )
+        if verify.overall_ok and verify.recommendation == "use_as_goal":
+            final_path = output_dir / "s_goal.png"
+            save_image(s_goal_img, final_path)
+            payload = {
+                "enabled": True,
+                "used_as_planning_target": True,
+                "fallback_to_target_path": False,
+                "max_retries": max_retries,
+                "identity_threshold": identity_threshold,
+                "attempts": attempts,
+                "selected_attempt": attempt_idx,
+                "s_goal_path": str(final_path),
+            }
+            (output_dir / "s_goal_verify.json").write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            log("[s_goal] PASSED; using S_goal as progressive endpoint.")
+            return s_goal_img, payload
+
+    payload = {
+        "enabled": True,
+        "used_as_planning_target": False,
+        "fallback_to_target_path": True,
+        "max_retries": max_retries,
+        "identity_threshold": identity_threshold,
+        "attempts": attempts,
+        "selected_attempt": None,
+        "last_candidate_available": last_img is not None,
+    }
+    (output_dir / "s_goal_verify.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log("[s_goal] FAILED after retries; falling back to direct S_pre -> TARGET progressive path.")
+    return None, payload
 
 
 def plan(
@@ -3568,15 +3828,50 @@ def progressive_pose_edit(
     max_trajectory_repairs: int = 2,
     max_pose_steps: int = 6,
     max_planning_attempts: int = 0,
+    skip_s_goal: bool = False,
+    s_goal_max_retries: int = 2,
+    s_goal_identity_threshold: float = 0.72,
 ) -> PipelineResult:
-    log("\n========== Phase 0: Staged Planning ==========")
+    s_goal_payload: Optional[dict[str, Any]] = None
+    planning_target_img = target_img
+    planning_target_name = "target"
+    if skip_s_goal:
+        log("\n========== Phase -0.5: S_goal One-Shot Generation Skipped ==========")
+        s_goal_payload = {
+            "enabled": False,
+            "used_as_planning_target": False,
+            "fallback_to_target_path": True,
+            "reason": "skip_s_goal=True",
+        }
+    else:
+        s_goal_img, s_goal_payload = generate_s_goal_until_verified(
+            source_img=source_img,
+            target_img=target_img,
+            editor=editor,
+            planner_vlm=planner_vlm,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            max_retries=s_goal_max_retries,
+            identity_threshold=s_goal_identity_threshold,
+        )
+        if s_goal_img is not None:
+            planning_target_img = s_goal_img
+            planning_target_name = "s_goal"
+
+    log(f"\n========== Phase 0: Staged Planning (target={planning_target_name}) ==========")
     analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
         source_img=source_img,
-        target_img=target_img,
+        target_img=planning_target_img,
         planner_vlm=planner_vlm,
         output_dir=output_dir,
         max_pose_steps=max_pose_steps,
         max_planning_attempts=max_planning_attempts,
+    )
+    raw_plan["planning_target"] = planning_target_name
+    raw_plan["s_goal"] = s_goal_payload
+    (output_dir / "plan.json").write_text(
+        json.dumps(raw_plan, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
     log("\n========== Phase 1: Progressive Execution (Pose -> Angle/Size) ==========")
@@ -3590,7 +3885,7 @@ def progressive_pose_edit(
             log(f"  staged step {step.step}/{len(steps)} [{step.transform_type}] {step.instruction}")
         trajectory, final_steps, verify_results = execute_progressive(
             source_img=source_img,
-            target_img=target_img,
+            target_img=planning_target_img,
             steps=steps,
             editor=editor,
             flow_estimator=flow_estimator,
@@ -3606,7 +3901,7 @@ def progressive_pose_edit(
     log("\n========== Phase 1.5: Trajectory Verify ==========")
     trajectory_verify = verify_trajectory(
         trajectory=trajectory,
-        target_img=target_img,
+        target_img=planning_target_img,
         flow_estimator=flow_estimator,
         planner_vlm=planner_vlm,
         shared_parts=analysis.shared_parts,
@@ -3628,7 +3923,7 @@ def progressive_pose_edit(
             trajectory=trajectory,
             final_steps=final_steps,
             verify_results=verify_results,
-            target_img=target_img,
+            target_img=planning_target_img,
             planner_vlm=planner_vlm,
             editor=editor,
             flow_estimator=flow_estimator,
@@ -3660,6 +3955,7 @@ def progressive_pose_edit(
         verify_results=verify_results,
         final_img=trajectory[-1],
         pre_alignment=pre_alignment,
+        s_goal=s_goal_payload,
         stage_plan=stage_plan,
         planning_verify=planning_verify,
         trajectory_verify=trajectory_verify,
@@ -3837,6 +4133,23 @@ def parse_args() -> argparse.Namespace:
         help="Retry planning until verified; 0 means unlimited.",
     )
     parser.add_argument(
+        "--skip_s_goal",
+        action="store_true",
+        help="Disable S_goal one-shot generation and use direct S_pre -> TARGET progressive editing.",
+    )
+    parser.add_argument(
+        "--s_goal_max_retries",
+        type=int,
+        default=2,
+        help="Retry S_goal one-shot generation this many times after the first failed attempt.",
+    )
+    parser.add_argument(
+        "--s_goal_identity_threshold",
+        type=float,
+        default=0.72,
+        help="Minimum DINO similarity between S_pre and S_goal for accepting S_goal.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable verbose progress logs (tqdm bar still shown).",
@@ -3863,6 +4176,7 @@ def trajectory_verify_to_dict(result: Optional[TrajectoryVerifyResult]) -> Optio
 def serializable_result(result: PipelineResult) -> dict[str, Any]:
     return {
         "pre_alignment": asdict(result.pre_alignment) if result.pre_alignment is not None else None,
+        "s_goal": result.s_goal,
         "stage_plan": asdict(result.stage_plan) if result.stage_plan is not None else None,
         "planning_verify": result.planning_verify,
         "analysis": asdict(result.analysis),
@@ -3998,6 +4312,9 @@ def main() -> None:
         max_trajectory_repairs=args.max_trajectory_repairs,
         max_pose_steps=args.max_pose_steps,
         max_planning_attempts=args.max_planning_attempts,
+        skip_s_goal=args.skip_s_goal,
+        s_goal_max_retries=args.s_goal_max_retries,
+        s_goal_identity_threshold=args.s_goal_identity_threshold,
     )
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
 
