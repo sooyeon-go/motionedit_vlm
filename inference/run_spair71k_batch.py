@@ -108,6 +108,50 @@ def append_worker_record(
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def load_existing_score_summary(output_dir: Path) -> dict[str, Any]:
+    result_path = output_dir / "result.json"
+    if not result_path.is_file():
+        return {}
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    score_summary = result.get("score_summary", {})
+    return score_summary if isinstance(score_summary, dict) else {}
+
+
+def aggregate_score_summaries(score_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    overall_scores: list[dict[str, float]] = []
+    per_step_scores: list[dict[str, float]] = []
+    trajectory_scores: list[dict[str, float]] = []
+    s_goal_scores: list[dict[str, float]] = []
+
+    for summary in score_summaries:
+        if not summary:
+            continue
+        overall = summary.get("overall_mean", {})
+        per_step = summary.get("per_step_mean", {})
+        trajectory = summary.get("trajectory", {})
+        s_goal = summary.get("s_goal", {})
+        if isinstance(overall, dict) and overall:
+            overall_scores.append(overall)
+        if isinstance(per_step, dict) and per_step:
+            per_step_scores.append(per_step)
+        if isinstance(trajectory, dict) and trajectory:
+            trajectory_scores.append(trajectory)
+        if isinstance(s_goal, dict) and s_goal:
+            s_goal_scores.append(s_goal)
+
+    return {
+        "scale": "0.0-5.0",
+        "num_samples_with_scores": len(overall_scores),
+        "overall_mean": ppe.average_score_dicts(overall_scores),
+        "per_step_mean": ppe.average_score_dicts(per_step_scores),
+        "trajectory_mean": ppe.average_score_dicts(trajectory_scores),
+        "s_goal_mean": ppe.average_score_dicts(s_goal_scores),
+    }
+
+
 def run_single_pair(
     pair: SpairPair,
     output_dir: Path,
@@ -174,9 +218,11 @@ def run_single_pair(
     )
 
     ppe.save_image(result.final_img, output_dir / "final.png")
+    final_folder = ppe.export_final_folder(output_dir, result)
     result_path = output_dir / "result.json"
+    serialized_result = ppe.serializable_result(result, final_folder=final_folder)
     result_path.write_text(
-        json.dumps(ppe.serializable_result(result), indent=2, ensure_ascii=False),
+        json.dumps(serialized_result, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -192,6 +238,7 @@ def run_single_pair(
         "trajectory_ok": (
             result.trajectory_verify.overall_ok if result.trajectory_verify is not None else None
         ),
+        "score_summary": serialized_result.get("score_summary", {}),
     }
 
 
@@ -384,6 +431,10 @@ def main() -> None:
 
     if not pending:
         log("[resume] All assigned pairs already complete; nothing to do.")
+        existing_score_summaries = [
+            load_existing_score_summary(pair_output_dir(output_root, pair))
+            for pair in skipped_existing
+        ]
         summary = {
             "worker_id": args.worker_id,
             "num_workers": args.num_workers,
@@ -394,6 +445,7 @@ def main() -> None:
             "pending": 0,
             "output_root": str(output_root),
             "worker_log": str(worker_log_path),
+            "score_summary": aggregate_score_summaries(existing_score_summaries),
         }
         summary_path = output_root / "logs" / f"worker_{args.worker_id:02d}_summary.json"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,11 +510,15 @@ def main() -> None:
     ok_count = 0
     skip_count = len(skipped_existing)
     fail_count = 0
+    score_summaries: list[dict[str, Any]] = []
 
     if skip_count:
         log(f"[resume] Skipping {skip_count} pair(s) with existing result.json + final.png")
         for pair in skipped_existing:
             out_dir = pair_output_dir(output_root, pair)
+            score_summary = load_existing_score_summary(out_dir)
+            if score_summary:
+                score_summaries.append(score_summary)
             append_worker_record(
                 worker_log_path,
                 {
@@ -472,6 +528,7 @@ def main() -> None:
                     "filename": pair.filename,
                     "split": pair.split,
                     "output_dir": str(out_dir),
+                    "score_summary": score_summary,
                 },
             )
 
@@ -492,6 +549,9 @@ def main() -> None:
                 args=args,
             )
             ok_count += 1
+            score_summary = record.get("score_summary", {})
+            if isinstance(score_summary, dict) and score_summary:
+                score_summaries.append(score_summary)
             append_worker_record(worker_log_path, record)
         except Exception as exc:
             fail_count += 1
@@ -519,6 +579,7 @@ def main() -> None:
         "skip_existing": args.skip_existing,
         "output_root": str(output_root),
         "worker_log": str(worker_log_path),
+        "score_summary": aggregate_score_summaries(score_summaries),
     }
     summary_path = output_root / "logs" / f"worker_{args.worker_id:02d}_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

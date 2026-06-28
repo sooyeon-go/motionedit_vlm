@@ -194,11 +194,12 @@ Rules:
 
 PLANNING_SYSTEM = """You are an expert visual geometry analyst and image editing planner.
 
-Your task: given a SOURCE image and a TARGET image containing objects of POSSIBLY
-DIFFERENT categories, plan a minimal sequence of small incremental image edits that
-progressively transform the SOURCE object's spatial configuration (viewpoint, scale,
-pose, deformation) to match the TARGET object's — while keeping everything else
-(especially object identity, texture, color, and material) unchanged.
+Your task: given a SOURCE image and an ENDPOINT geometry reference image containing
+objects of POSSIBLY DIFFERENT categories, plan a sequence of trackable interpolation
+edits that progressively transform the SOURCE object's spatial configuration
+(viewpoint, scale, pose, deformation) to match the ENDPOINT object's geometry —
+while keeping everything else (especially object identity, texture, color, and
+material) unchanged.
 
 CRITICAL — instruction style for the editor:
   Each step's "instruction" field is sent DIRECTLY to an image editing diffusion model.
@@ -211,18 +212,29 @@ Key principle:
   You are NOT replacing the source object with the target.
   You are ONLY changing its geometric configuration.
   The source object must remain exactly what it is.
+  Priority 1: the final frame must match the ENDPOINT pose, camera angle, scale,
+  and visible part layout.
+  Priority 2: intermediate frames should form a trackable interpolation path.
 
 Output valid JSON only. No prose, no markdown fences outside JSON."""
 
 PLANNING_USER = """Images provided:
   IMAGE 1 = SOURCE — the object to be edited
-  IMAGE 2 = TARGET — reference for the desired geometric configuration
+  IMAGE 2 = ENDPOINT — reference for the desired geometric configuration
 
 Goal: produce exactly {n_steps} incremental editing steps that move the SOURCE object
-from its current configuration toward the TARGET object's configuration.
-The TARGET image is a geometry/pose reference only. If SOURCE and TARGET have
+from its current configuration toward the ENDPOINT object's configuration.
+The ENDPOINT image is a geometry/pose reference only. If SOURCE and ENDPOINT have
 different identities or categories, preserve the SOURCE identity/category and use
-only analogous TARGET geometry, viewpoint, scale, pose, deformation, and placement.
+only analogous ENDPOINT geometry, viewpoint, scale, pose, deformation, and placement.
+
+Interpolation objective:
+  The final step should match ENDPOINT geometry as closely as possible.
+  Each intermediate step should look like a moderate-small interpolation step, similar
+  to the object pose/view change between video frames about 8-10 frames apart:
+  clear visible progress, but still trackable between consecutive images.
+  Do not make steps so tiny that there is almost no progress, and do not make steps
+  so large that major object parts cannot be tracked from the previous frame.
 
 ════════════════════════════════════════════
 PHASE A — ANALYSIS (fill every field)
@@ -244,8 +256,9 @@ A1b. SHARED PARTS (critical — fill before planning steps)
   (e.g. head, tail, four legs, ears for animals; wheels, headlights, windshield for cars).
   Cross-category: use analogous names (cat head ↔ dog head counts as shared).
   Parts visible on only one image must NOT be listed.
-  Every shared part must remain clearly visible in the edited object after EVERY step.
-  Do not plan edits that remove, erase, occlude, or crop out any shared part.
+  Shared parts should remain identifiable across consecutive interpolation steps.
+  If ENDPOINT geometry naturally occludes a source-visible part, make that visibility
+  change gradual rather than abrupt.
 
 A2. TRANSFORM GAP ANALYSIS — assess each axis:
   First pick a TWO-landmark axis on source and target
@@ -290,9 +303,11 @@ ORDERING PRIORITY (coarse → fine):
   5. Translation and fine adjustments last
 
 STEP SIZE CONSTRAINT:
-  Each step must be a SMALL, incremental change — one clear visual adjustment.
-  Every part of the object must remain individually identifiable from the previous frame.
-  Each step should be matchable by a standard feature matcher (small motion only).
+  Each step must be a moderate-small interpolation change — one clear visual adjustment.
+  The desired step size is comparable to an object pose/view change across about
+  8-10 frames in a video: visible progress, but still trackable.
+  Major parts should remain individually identifiable from the previous frame.
+  Avoid part identity swaps, abrupt disappearances, topology changes, or sudden jumps.
 
 INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
   The "instruction" field goes directly to the image editor. Write it as a clear,
@@ -319,13 +334,13 @@ INSTRUCTION FORMAT — natural descriptive edit prompts (NOT numeric geometry):
 
 HARD CONSTRAINTS (enforce on every step):
   - Do NOT change: object category, texture, color, material, surface details
-  - ALL shared_parts must remain clearly visible after this step (never remove or hide them)
+  - Shared parts and major source-visible parts must remain trackable across consecutive steps
   - Do NOT plan horizontal flip or whole-image mirror transforms (handled in pre-align)
   - Do NOT plan coarse whole-object rotation unless fixing a small residual tilt
   - Use identifiable parts in instructions (head, tail, paws, wheels, hands, etc.)
   - Do NOT use degree numbers, percentages, or ratio values in "instruction"
   - Do NOT perform two dominant transforms in one step
-  - Each step must move the configuration CLOSER to the target, never sideways
+  - Each step should make visible progress toward ENDPOINT geometry without sacrificing trackability
 
 cumulative_progress: fraction of total gap closed after this step (0.0 → 1.0)
 
@@ -351,7 +366,7 @@ OUTPUT JSON SCHEMA
         "part_name": "head",
         "source_label": "head",
         "target_label": "head",
-        "must_remain_visible": true
+        "should_remain_trackable": true
       }}
     ],
     "transform_gaps": {{
@@ -389,18 +404,18 @@ OUTPUT JSON SCHEMA
 }}"""
 
 VERIFY_SYSTEM = """You are an image editing quality verifier.
-Answer every question with exactly 'Yes' or 'No'.
+Answer each checklist question with exactly 'Yes' or 'No', then provide the requested numeric scores.
 Be strict and precise."""
 
 VERIFY_USER = """SOURCE → BEFORE → AFTER edit sequence.
 IMAGE 1 = BEFORE this step
 IMAGE 2 = AFTER this step
-IMAGE 3 = TARGET configuration (final reference)
+IMAGE 3 = ENDPOINT configuration (final reference)
 
 Important: IMAGE 3 is only a geometry/pose reference. Do not require the edited
-object to adopt the TARGET object's identity, category, texture, color, or material.
-The edited object must preserve the SOURCE identity and only move closer to TARGET
-geometry/configuration.
+object to adopt the ENDPOINT object's identity, category, texture, color, or material.
+The edited object must preserve the SOURCE identity and move closer to ENDPOINT
+geometry/configuration through a trackable interpolation step.
 
 This step's instruction: "{instruction}"
 Transform type: {transform_type}
@@ -409,10 +424,12 @@ Expected change: {expected_change}
 Answer Yes or No for each:
 1. Was the instructed geometric change applied? (viewpoint/scale/pose as specified)
 2. Is the source object's identity preserved? (same category, texture, color, material)
-3. Is the change physically/geometrically plausible?
-4. Are there no visual artifacts?
+3. Is the change size comparable to a short video temporal gap (about 8-10 frames),
+   with visible progress but no abrupt jump?
+4. Are major object parts still trackable from IMAGE 1 to IMAGE 2, with no part swaps,
+   sudden disappearances, or topology changes?
 5. After this edit, is the SOURCE object's pose, size, and rotation/orientation
-   closer to the TARGET's pose, size, and rotation (geometry only — not identity)?
+   closer to the ENDPOINT's pose, size, and rotation (geometry only — not identity)?
 {shared_parts_question}
 Format:
 1. Yes/No
@@ -420,17 +437,35 @@ Format:
 3. Yes/No
 4. Yes/No
 5. Yes/No
-{shared_parts_format}"""
+{shared_parts_format}
+
+Then provide diagnostic scores for offline analysis only. These scores do NOT affect
+editing acceptance. Use 0.0-5.0 where 5.0 is best:
+Scores:
+- interpolation_quality: did IMAGE 2 form a useful, trackable intermediate sample
+  from IMAGE 1, with a moderate-small step size?
+- target_geometry_match: how well does IMAGE 2 move toward IMAGE 3 pose, camera
+  angle, size/framing, and visible part layout?
+- source_identity_preservation: how well does IMAGE 2 preserve IMAGE 1 identity,
+  category, texture, color, material, and surface details?
+- overall_quality: overall quality of this edited step for the progressive trajectory.
+
+Score format:
+interpolation_quality: 0.0
+target_geometry_match: 0.0
+source_identity_preservation: 0.0
+overall_quality: 0.0"""
 
 VERIFY_SHARED_PARTS_BLOCK = """
-Shared parts that must remain clearly visible on the edited object (present on BOTH
-source and target geometry). None of these may disappear or become unrecognizable:
+Shared parts that should remain trackable across this transition (present on BOTH
+source and endpoint geometry). If endpoint geometry naturally occludes a part, the
+visibility change should be gradual rather than abrupt:
 {shared_parts_list}
 """
 
 VERIFY_SHARED_PARTS_QUESTION = (
-    "6. Are ALL of the listed shared parts still clearly visible and recognizable "
-    "on the edited object in IMAGE 2?"
+    "6. Are the listed shared parts still identifiable/trackable in IMAGE 2, "
+    "unless they are naturally and gradually becoming occluded by endpoint geometry?"
 )
 
 VERIFY_NO_SHARED_PARTS_BLOCK = ""
@@ -494,6 +529,7 @@ Rules:
 SGOAL_EDIT_PROMPT = """Edit IMAGE 1 so that its object matches IMAGE 2's pose, camera view, scale, and visible part layout.
 
 Hard requirements:
+- Most important: match IMAGE 2 geometry as closely as possible (pose, camera angle, scale/framing, visible part layout).
 - Preserve IMAGE 1 object's identity, category, texture, color, material, and surface details.
 - Use IMAGE 2 only as geometry reference for pose, camera angle, size/framing, and visible part layout.
 - Do NOT copy IMAGE 2 object's identity, texture, color, material, or category-specific appearance.
@@ -512,6 +548,9 @@ IMAGE 3 = TARGET geometry reference
 Goal:
 Decide whether IMAGE 2 is a good endpoint for later progressive editing from IMAGE 1.
 IMAGE 2 should preserve IMAGE 1 identity while matching IMAGE 3 geometry.
+Endpoint geometry match is the highest priority: pose, camera angle, scale/framing,
+and visible part layout should match IMAGE 3. Reachability from IMAGE 1 is useful
+but secondary; do not reject a strong geometry match only because the path may be hard.
 
 Objective identity score DINO(IMAGE 1, IMAGE 2): {identity_score:.3f}
 Required minimum identity score: {identity_threshold:.3f}
@@ -526,6 +565,12 @@ Return this exact JSON:
   "not_target_copy": true,
   "target_visible_layout_match": true,
   "no_severe_artifacts": true,
+  "scores": {{
+    "interpolation_quality": 0.0,
+    "target_geometry_match": 0.0,
+    "source_identity_preservation": 0.0,
+    "overall_quality": 0.0
+  }},
   "recommendation": "use_as_goal | retry | fallback_to_target_path",
   "failure_reason": "short reason if not overall_ok"
 }}
@@ -538,6 +583,13 @@ Rules:
 - not_target_copy: IMAGE 2 must not copy TARGET identity/texture/material/category appearance.
 - target_visible_layout_match: parts visible in TARGET should be visible and arranged similarly in IMAGE 2.
 - Do not force IMAGE 1-only parts to remain visible if TARGET naturally occludes them.
+- no_severe_artifacts: reject only severe geometry-breaking artifacts that would harm matching/tracking.
+- scores are for offline analysis only and do not change the hard pass/fail checks.
+- interpolation_quality for S_GOAL means whether IMAGE 2 is a useful endpoint candidate
+  for later progressive interpolation from IMAGE 1.
+- target_geometry_match scores pose, camera angle, scale/framing, and visible part layout.
+- source_identity_preservation scores preservation of IMAGE 1 identity/category/texture/material.
+- overall_quality is the overall S_GOAL endpoint quality.
 - overall_ok=true only if all hard checks are true and identity score is above threshold."""
 
 PLANNING_VERIFY_SYSTEM = """You are a strict editing-plan auditor.
@@ -545,7 +597,7 @@ Answer with valid JSON only."""
 
 PLANNING_VERIFY_USER = """Images:
 IMAGE 1 = CURRENT SOURCE after pre-align
-IMAGE 2 = TARGET geometry reference
+IMAGE 2 = ENDPOINT geometry reference
 
 Plan JSON:
 {plan_json}
@@ -562,10 +614,12 @@ Required policy:
   elevation: low-angle shot | eye-level shot | elevated shot | high-angle shot
   distance: close-up | medium shot | wide shot
 - Skip pose stage if no pose/deformation is needed.
-- Skip angle/size stage if source/current already matches target camera and distance.
+- Skip angle/size stage if source/current already matches endpoint camera and distance.
 - Every step must preserve source identity/category/texture/material.
-- Shared parts must remain visible.
-- The plan must not copy target identity.
+- Step sizes should be moderate-small, like object pose/view change over about 8-10 video frames.
+- Steps should make visible progress while keeping major parts trackable between consecutive frames.
+- Shared parts should remain identifiable/trackable unless endpoint geometry gradually occludes them.
+- The plan must preserve source identity and must not copy non-source identity.
 
 Return this exact JSON:
 {{
@@ -580,12 +634,12 @@ Return this exact JSON:
 }}"""
 
 DIAGNOSIS_SYSTEM = """You are a visual geometry diagnostician for staged image editing.
-Given SOURCE and TARGET images, classify pose/deformation need and camera/size gap.
+Given SOURCE and ENDPOINT images, classify pose/deformation need and camera/size gap.
 Output valid JSON only."""
 
 DIAGNOSIS_USER = """Images:
 IMAGE 1 = CURRENT SOURCE after pre-align
-IMAGE 2 = TARGET geometry reference only
+IMAGE 2 = ENDPOINT geometry reference only
 
 Goal:
 Decide whether to run:
@@ -593,6 +647,9 @@ Decide whether to run:
 2) a Qwen angle-LoRA camera/size stage.
 
 Use only visible image evidence. Do not use dataset annotations.
+The ENDPOINT geometry match is the final priority. The later progressive steps should
+split this gap into trackable interpolation changes, roughly like 8-10 video-frame
+pose/view differences per step.
 
 Camera prompt vocabulary:
 - azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
@@ -617,7 +674,7 @@ Return this exact JSON:
       {{"source_part": "...", "target_part": "...", "analogous": true, "visible_on_both": true}}
     ],
     "shared_parts": [
-      {{"part_name": "...", "source_label": "...", "target_label": "...", "must_remain_visible": true}}
+      {{"part_name": "...", "source_label": "...", "target_label": "...", "should_remain_trackable": true}}
     ],
     "transform_gaps": {{
       "viewpoint": {{"azimuth": "...", "elevation": "...", "inplane_rotation": "..."}},
@@ -656,7 +713,7 @@ Output valid JSON only."""
 
 POSE_PLANNING_USER = """Images:
 IMAGE 1 = CURRENT SOURCE after pre-align
-IMAGE 2 = TARGET geometry reference only
+IMAGE 2 = ENDPOINT geometry reference only
 
 Stage diagnosis:
 {diagnosis_json}
@@ -669,7 +726,12 @@ Instruction style:
 - Natural descriptive edit prompt.
 - Use body/object parts and spatial relations.
 - Preserve source identity/category/texture/material.
-- Keep all shared parts visible.
+- Each step should be a moderate-small trackable interpolation, like an 8-10 frame
+  pose change in a video: visible progress, no abrupt jump.
+- Keep major parts identifiable across consecutive steps; avoid part swaps, sudden
+  disappearances, or topology changes.
+- If ENDPOINT geometry occludes a source-visible part, introduce that visibility
+  change gradually.
 - One dominant pose/deformation change per step.
 
 Return:
@@ -697,24 +759,26 @@ Output valid JSON only."""
 
 REPLAN_USER = """IMAGE 1 = BEFORE edit
 IMAGE 2 = AFTER edit (FAILED)
-IMAGE 3 = TARGET configuration (final reference)
+IMAGE 3 = ENDPOINT configuration (final reference)
 
 Important: IMAGE 3 is only a geometry/pose reference. The corrected instruction
 must preserve SOURCE identity/category/texture/material and must not ask the editor
-to copy TARGET identity.
+to copy ENDPOINT identity.
 
 Original instruction: "{failed_instruction}"
 Transform type: {transform_type}
 Expected change: {expected_change}
 Identity warning: {identity_warning}
 Failure reason: {failure_reason}
-Shared parts that must stay visible: {shared_parts_list}
+Shared parts that should stay trackable across the corrected transition: {shared_parts_list}
 
 Write the corrected instruction as a natural edit prompt, e.g.:
   "Have the cat turn its head and body slightly toward the left."
   "Make the cat lower its front paws while keeping its hind legs in place."
 Do NOT use degree numbers or percentages.
-All shared parts listed above must remain clearly visible in the corrected edit.
+The corrected edit should be a moderate-small trackable interpolation step, similar
+to about 8-10 frames of object motion in a video. Major parts should remain trackable
+from IMAGE 1 to the corrected edit, with no part swaps or abrupt disappearances.
 
 Analyze why it failed and provide a CORRECTED instruction:
 {{
@@ -731,40 +795,61 @@ Analyze why it failed and provide a CORRECTED instruction:
 TRAJECTORY_VERIFY_SYSTEM = """You are a trajectory quality verifier for sparse keyframe editing.
 
 You will see an ordered sequence of edited SOURCE images (starting from a pre-aligned
-source) plus a TARGET image at the end as a geometry reference only.
+source) plus an ENDPOINT image at the end as a geometry reference only.
 
 CRITICAL:
   - The edited object must keep the SOURCE identity (category, texture, color, material)
-    throughout every keyframe. Never expect it to look like the TARGET object.
+    throughout every keyframe. Never expect it to look like the ENDPOINT object.
   - Judge only whether SOURCE geometry — pose, size, rotation/orientation, and analogous
-    part layout — progressively moves toward the TARGET's pose, size, and rotation.
+    part layout — progressively moves toward the ENDPOINT's pose, size, and rotation.
+  - The final frame should match ENDPOINT geometry well. Intermediate steps should be
+    trackable interpolation frames, each roughly like an 8-10 video-frame motion gap.
 
-These are sparse intermediate keyframes (not a dense video). Small jumps between
-consecutive keyframes are OK. Flag sudden geometry reversals or part disappearances."""
+These are sparse intermediate keyframes (not a dense video). Moderate-small jumps are
+OK if major parts remain trackable. Flag abrupt geometry reversals, part swaps,
+topology changes, or sudden disappearances."""
 
 TRAJECTORY_VERIFY_USER = """Ordered SOURCE editing trajectory:
 {step_image_notes}
-Final image = TARGET (geometry reference ONLY for pose, size, rotation — NOT identity).
+Final image = ENDPOINT (geometry reference ONLY for pose, size, rotation — NOT identity).
 
 The object in every step must remain the SOURCE object. Do not penalize the sequence
-for failing to match TARGET identity, texture, color, or category.
+for failing to match ENDPOINT identity, texture, color, or category.
 
-Shared SOURCE parts (also present on TARGET geometry) that must stay visible:
+Shared SOURCE parts (also present on ENDPOINT geometry) that should stay trackable:
 {shared_parts_list}
 
 Answer Yes or No for each:
 1. Does the SOURCE object progressively change its pose, size, and rotation/orientation
-   toward the TARGET's pose, size, and rotation across the sequence?
-   (Geometry only. SOURCE identity must stay the same. Sparse keyframe jumps are OK.)
-2. Are there abrupt non-progressive geometry jumps or reversals in pose/size/rotation
-   between any consecutive steps?
-3. Are ALL listed shared parts still clearly visible and recognizable on the SOURCE
-   object across the sequence?
+   toward the ENDPOINT's pose, size, and rotation across the sequence, with the final
+   frame closely matching ENDPOINT geometry?
+   (Geometry only. SOURCE identity must stay the same.)
+2. Are there abrupt non-progressive geometry jumps, reversals, part swaps, topology
+   changes, or sudden disappearances between any consecutive steps?
+3. Are listed shared parts and major object parts trackable across consecutive frames,
+   unless they gradually become occluded by ENDPOINT geometry?
 
 Format:
 1. Yes/No
 2. Yes/No
-3. Yes/No"""
+3. Yes/No
+
+Then provide diagnostic scores for offline analysis only. These scores do NOT affect
+editing acceptance. Use 0.0-5.0 where 5.0 is best:
+Scores:
+- interpolation_quality: how smooth/trackable/useful are the intermediate samples
+  as a sparse progressive trajectory?
+- target_geometry_match: how well does the final SOURCE object match ENDPOINT pose,
+  camera angle, size/framing, and visible part layout?
+- source_identity_preservation: how well is SOURCE identity/category/texture/material
+  preserved across the whole trajectory?
+- overall_quality: overall trajectory quality.
+
+Score format:
+interpolation_quality: 0.0
+target_geometry_match: 0.0
+source_identity_preservation: 0.0
+overall_quality: 0.0"""
 
 
 # ============================================================
@@ -823,6 +908,7 @@ class SGoalVerifyResult:
     recommendation: str
     identity_score: float
     identity_threshold: float
+    scores: dict[str, float] = field(default_factory=dict)
     failure_reason: Optional[str] = None
 
 
@@ -876,6 +962,7 @@ class VLMVerifyResult:
     no_artifacts: bool
     closer_to_target: bool
     shared_parts_visible: bool = True
+    scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -888,6 +975,7 @@ class VerifyResult:
     semantic_ok: bool
     shared_parts_ok: bool
     overall_ok: bool
+    scores: dict[str, float] = field(default_factory=dict)
     failure_reason: Optional[str] = None
 
 
@@ -911,6 +999,7 @@ class TrajectoryVLMVerifyResult:
     progressive_toward_target: bool
     abrupt_jumps: bool
     shared_parts_visible: bool
+    scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -971,8 +1060,39 @@ def parse_yes_no(text: str, num_questions: int = 6) -> dict[int, bool]:
     return answers
 
 
+SCORE_KEYS = (
+    "interpolation_quality",
+    "target_geometry_match",
+    "source_identity_preservation",
+    "overall_quality",
+)
+
+
+def _clip_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(5.0, score))
+
+
+def parse_score_dict(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    return {key: _clip_score(raw.get(key, 0.0)) for key in SCORE_KEYS if key in raw}
+
+
+def parse_scores(text: str) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for key in SCORE_KEYS:
+        match = re.search(rf"\b{re.escape(key)}\s*:\s*([0-5](?:\.\d+)?)", text, re.IGNORECASE)
+        if match:
+            scores[key] = _clip_score(match.group(1))
+    return scores
+
+
 def extract_shared_parts(analysis_dict: dict[str, Any]) -> list[str]:
-    """Parts visible on both source and target that must stay visible during editing."""
+    """Parts visible on both source and endpoint that should stay trackable."""
     raw = analysis_dict.get("shared_parts") or []
     names: list[str] = []
     for item in raw:
@@ -983,7 +1103,7 @@ def extract_shared_parts(analysis_dict: dict[str, Any]) -> list[str]:
                 or item.get("source_label")
                 or item.get("target_label")
             )
-            if label and item.get("must_remain_visible", True):
+            if label and item.get("should_remain_trackable", item.get("must_remain_visible", True)):
                 names.append(str(label).strip())
         elif item:
             names.append(str(item).strip())
@@ -2188,7 +2308,7 @@ def bruteforce_pre_align_source(
             ],
         },
     ]
-    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=768))
     raw_id = parsed.get("best_candidate_id", 0)
     try:
         best_id = int(raw_id)
@@ -2474,6 +2594,7 @@ def verify_s_goal_image(
         recommendation=recommendation,
         identity_score=float(identity_score),
         identity_threshold=identity_threshold,
+        scores=parse_score_dict(parsed.get("scores")),
         failure_reason=failure_reason,
     )
 
@@ -2608,7 +2729,7 @@ def plan(
                 {"type": "image", "image": source_img},
                 {"type": "text", "text": "(IMAGE 1 = SOURCE)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 2 = ENDPOINT)"},
                 {"type": "text", "text": PLANNING_USER.format(n_steps=n_steps) + prealign_note},
             ],
         },
@@ -2625,7 +2746,7 @@ def plan(
     log(f"[plan] Done in {elapsed:.1f}s — source: {src_desc}")
     log(f"[plan] Target geometry ref: {tgt_desc}")
     if analysis.shared_parts:
-        log(f"[plan] Shared parts (must stay visible): {format_shared_parts_list(analysis.shared_parts)}")
+        log(f"[plan] Shared parts (track across steps): {format_shared_parts_list(analysis.shared_parts)}")
     else:
         log("[plan] Shared parts: none identified by planner")
     for step in steps:
@@ -2658,7 +2779,7 @@ def diagnose_stage_plan(
                 {"type": "image", "image": source_img},
                 {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 2 = ENDPOINT)"},
                 {
                     "type": "text",
                     "text": DIAGNOSIS_USER.format(max_pose_steps=max_pose_steps)
@@ -2703,7 +2824,7 @@ def verify_planning(
                 {"type": "image", "image": source_img},
                 {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 2 = ENDPOINT)"},
                 {
                     "type": "text",
                     "text": PLANNING_VERIFY_USER.format(
@@ -2746,7 +2867,7 @@ def plan_pose_stage(
                 {"type": "image", "image": source_img},
                 {"type": "text", "text": "(IMAGE 1 = CURRENT SOURCE)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 2 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 2 = ENDPOINT)"},
                 {"type": "text", "text": prompt},
             ],
         },
@@ -2864,7 +2985,7 @@ def vlm_verify(
                 {"type": "image", "image": after},
                 {"type": "text", "text": "(IMAGE 2 = AFTER)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 3 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 3 = ENDPOINT)"},
                 {
                     "type": "text",
                     "text": build_verify_prompt(
@@ -2877,7 +2998,8 @@ def vlm_verify(
             ],
         },
     ]
-    answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128), num_questions=num_questions)
+    response = planner_vlm.chat(messages, max_new_tokens=256)
+    answers = parse_yes_no(response, num_questions=num_questions)
     shared_parts_visible = answers.get(6, True) if shared_parts else True
     return VLMVerifyResult(
         geometric_change_applied=answers.get(1, False),
@@ -2886,6 +3008,7 @@ def vlm_verify(
         no_artifacts=answers.get(4, False),
         closer_to_target=answers.get(5, False),
         shared_parts_visible=shared_parts_visible,
+        scores=parse_scores(response),
     )
 
 
@@ -2910,7 +3033,7 @@ def replan(
                 {"type": "image", "image": failed_after},
                 {"type": "text", "text": "(IMAGE 2 = AFTER edit — FAILED)"},
                 {"type": "image", "image": target_img},
-                {"type": "text", "text": "(IMAGE 3 = TARGET)"},
+                {"type": "text", "text": "(IMAGE 3 = ENDPOINT)"},
                 {
                     "type": "text",
                     "text": REPLAN_USER.format(
@@ -3176,7 +3299,7 @@ def vlm_verify_trajectory(
     content.append(
         {
             "type": "text",
-            "text": f"(IMAGE {len(trajectory) + 1} = TARGET geometry reference)",
+            "text": f"(IMAGE {len(trajectory) + 1} = ENDPOINT geometry reference)",
         }
     )
     content.append(
@@ -3193,12 +3316,14 @@ def vlm_verify_trajectory(
         {"role": "system", "content": [{"type": "text", "text": TRAJECTORY_VERIFY_SYSTEM}]},
         {"role": "user", "content": content},
     ]
-    answers = parse_yes_no(planner_vlm.chat(messages, max_new_tokens=128), num_questions=3)
+    response = planner_vlm.chat(messages, max_new_tokens=256)
+    answers = parse_yes_no(response, num_questions=3)
     shared_parts_visible = answers.get(3, True) if shared_parts else True
     return TrajectoryVLMVerifyResult(
         progressive_toward_target=answers.get(1, False),
         abrupt_jumps=answers.get(2, False),
         shared_parts_visible=shared_parts_visible,
+        scores=parse_scores(response),
     )
 
 
@@ -3251,7 +3376,8 @@ def verify_trajectory(
             "[trajectory] VLM: "
             f"geometry_progressive={vlm_result.progressive_toward_target}, "
             f"abrupt_geometry_jumps={vlm_result.abrupt_jumps}, "
-            f"shared_parts={vlm_result.shared_parts_visible}"
+            f"shared_parts={vlm_result.shared_parts_visible}, "
+            f"scores={vlm_result.scores}"
         )
         vlm_ok = (
             vlm_result.progressive_toward_target
@@ -3266,13 +3392,13 @@ def verify_trajectory(
     if vlm_result is not None:
         if not vlm_result.progressive_toward_target:
             failure_reasons.append(
-                "VLM: SOURCE geometry (pose/size/rotation) not progressively toward TARGET"
+                "VLM: SOURCE geometry (pose/size/rotation) not progressively toward ENDPOINT"
             )
         if vlm_result.abrupt_jumps:
-            failure_reasons.append("VLM: abrupt geometry jumps or reversals detected")
+            failure_reasons.append("VLM: abrupt geometry jumps, reversals, part swaps, or topology changes detected")
         if not vlm_result.shared_parts_visible:
             failure_reasons.append(
-                f"VLM: shared parts not visible throughout: "
+                f"VLM: shared parts not trackable across the trajectory: "
                 f"{format_shared_parts_list(shared_parts)}"
             )
 
@@ -3444,9 +3570,10 @@ def verify_edit(
             f"geometry={vlm_result.geometric_change_applied}, "
             f"identity={vlm_result.identity_preserved}, "
             f"shared_parts={vlm_result.shared_parts_visible}, "
-            f"plausible={vlm_result.physically_plausible}, "
-            f"artifacts_free={vlm_result.no_artifacts}, "
-            f"closer_to_target={vlm_result.closer_to_target}"
+            f"step_size_ok={vlm_result.physically_plausible}, "
+            f"trackable_transition={vlm_result.no_artifacts}, "
+            f"closer_to_endpoint={vlm_result.closer_to_target}, "
+            f"scores={vlm_result.scores}"
         )
     shared_parts_ok = vlm_result.shared_parts_visible if shared_parts else True
     overall = (
@@ -3472,15 +3599,15 @@ def verify_edit(
             reasons.append("VLM: identity not preserved")
         if not shared_parts_ok:
             reasons.append(
-                f"Shared parts no longer visible: {format_shared_parts_list(shared_parts)}"
+                f"Shared parts are not trackable: {format_shared_parts_list(shared_parts)}"
             )
         if not vlm_result.physically_plausible:
-            reasons.append("Change not physically plausible")
+            reasons.append("Step size is not comparable to a trackable short video gap")
         if not vlm_result.no_artifacts:
-            reasons.append("Visual artifacts detected")
+            reasons.append("Major parts are not trackable or changed identity abruptly")
         if not vlm_result.closer_to_target:
             reasons.append(
-                "SOURCE geometry (pose/size/rotation) not closer to TARGET than before"
+                "SOURCE geometry (pose/size/rotation) not closer to ENDPOINT than before"
             )
         failure_reason = "; ".join(reasons)
 
@@ -3493,6 +3620,7 @@ def verify_edit(
         semantic_ok=vlm_result.geometric_change_applied,
         shared_parts_ok=shared_parts_ok,
         overall_ok=overall,
+        scores=vlm_result.scores,
         failure_reason=failure_reason,
     )
 
@@ -3602,7 +3730,7 @@ def execute_progressive(
 
     log(f"[execute] Starting progressive editing ({len(steps)} steps, max_retries={max_retries})")
     if shared_parts:
-        log(f"[execute] Preserving shared parts: {format_shared_parts_list(shared_parts)}")
+        log(f"[execute] Tracking shared parts: {format_shared_parts_list(shared_parts)}")
     step_bar = tqdm(steps, desc="Editing steps", unit="step", disable=not VERBOSE)
 
     for step_idx, step in enumerate(step_bar, start=1):
@@ -4173,8 +4301,89 @@ def trajectory_verify_to_dict(result: Optional[TrajectoryVerifyResult]) -> Optio
     }
 
 
-def serializable_result(result: PipelineResult) -> dict[str, Any]:
+def average_score_dicts(score_dicts: list[dict[str, float]]) -> dict[str, float]:
+    valid = [scores for scores in score_dicts if scores]
+    if not valid:
+        return {}
+    averaged: dict[str, float] = {}
+    for key in SCORE_KEYS:
+        values = [float(scores[key]) for scores in valid if key in scores]
+        if values:
+            averaged[key] = round(sum(values) / len(values), 4)
+    return averaged
+
+
+def summarize_scores(result: PipelineResult) -> dict[str, Any]:
+    step_score_dicts = [verify.scores for verify in result.verify_results if verify.scores]
+    trajectory_scores = (
+        result.trajectory_verify.vlm.scores
+        if result.trajectory_verify is not None and result.trajectory_verify.vlm is not None
+        else {}
+    )
+
+    s_goal_scores: dict[str, float] = {}
+    if result.s_goal:
+        attempts = result.s_goal.get("attempts", [])
+        selected_attempt = result.s_goal.get("selected_attempt")
+        for attempt in attempts:
+            if attempt.get("attempt") == selected_attempt:
+                verify = attempt.get("verify", {})
+                s_goal_scores = parse_score_dict(verify.get("scores"))
+                break
+
+    combined_score_dicts = list(step_score_dicts)
+    if trajectory_scores:
+        combined_score_dicts.append(trajectory_scores)
+    if s_goal_scores:
+        combined_score_dicts.append(s_goal_scores)
+
     return {
+        "scale": "0.0-5.0",
+        "per_step_mean": average_score_dicts(step_score_dicts),
+        "trajectory": trajectory_scores,
+        "s_goal": s_goal_scores,
+        "overall_mean": average_score_dicts(combined_score_dicts),
+        "num_scored_steps": len(step_score_dicts),
+    }
+
+
+def export_final_folder(output_dir: Path, result: PipelineResult) -> dict[str, Any]:
+    """Save source, interpolation frames, and final image under output_dir/final/."""
+    final_dir = output_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    trajectory = result.trajectory
+    if not trajectory:
+        return {
+            "source": None,
+            "interpolation": [],
+            "final": None,
+            "num_interpolation_frames": 0,
+        }
+
+    save_image(trajectory[0], final_dir / "source.png")
+
+    interpolation_paths: list[str] = []
+    for idx, image in enumerate(trajectory[1:-1], start=1):
+        rel_name = f"step_{idx:02d}.png"
+        save_image(image, final_dir / rel_name)
+        interpolation_paths.append(f"final/{rel_name}")
+
+    save_image(trajectory[-1], final_dir / "final.png")
+
+    return {
+        "source": "final/source.png",
+        "interpolation": interpolation_paths,
+        "final": "final/final.png",
+        "num_interpolation_frames": len(interpolation_paths),
+    }
+
+
+def serializable_result(
+    result: PipelineResult,
+    final_folder: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = {
         "pre_alignment": asdict(result.pre_alignment) if result.pre_alignment is not None else None,
         "s_goal": result.s_goal,
         "stage_plan": asdict(result.stage_plan) if result.stage_plan is not None else None,
@@ -4184,9 +4393,13 @@ def serializable_result(result: PipelineResult) -> dict[str, Any]:
         "verify_results": [asdict(verify) for verify in result.verify_results],
         "trajectory_verify": trajectory_verify_to_dict(result.trajectory_verify),
         "trajectory_repair": result.trajectory_repair,
+        "score_summary": summarize_scores(result),
         "final_image": "final.png",
         "trajectory": [f"step_{idx:02d}.png" for idx in range(len(result.trajectory))],
     }
+    if final_folder is not None:
+        payload["final_folder"] = final_folder
+    return payload
 
 
 def main() -> None:
@@ -4320,19 +4533,21 @@ def main() -> None:
 
     log("\n[output] Writing final artifacts")
     save_image(result.final_img, output_dir / "final.png")
+    final_folder = export_final_folder(output_dir, result)
     result_path = output_dir / "result.json"
     result_path.write_text(
-        json.dumps(serializable_result(result), indent=2, ensure_ascii=False),
+        json.dumps(serializable_result(result, final_folder=final_folder), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     log(f"  saved {result_path}")
     log(f"\nDone. Outputs in {output_dir}")
-    log("  step_00.png .. step_NN.png  — editing trajectory")
+    log("  step_00.png .. step_NN.png  — full editing trajectory (debug/log)")
+    log("  final/                      — source + interpolation + final only")
     log("  plan.json                   — VLM editing plan")
     log("  trajectory_verify.json      — flow + VLM trajectory continuity")
     log("  trajectory_repair.json      — suspect-step cascade repair log (if run)")
-    log("  final.png                   — final result")
-    log("  result.json                 — analysis + verify summary")
+    log("  final.png                   — final result (same as final/final.png)")
+    log("  result.json                 — analysis + verify summary + scores")
 
 
 if __name__ == "__main__":

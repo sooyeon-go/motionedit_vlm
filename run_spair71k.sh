@@ -184,3 +184,77 @@ fi
 trap - INT TERM
 echo "[run_spair71k] all workers finished."
 echo "[run_spair71k] summaries: ${OUTPUT_ROOT}/logs/worker_*_summary.json"
+
+python - "${OUTPUT_ROOT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+SCORE_KEYS = (
+    "interpolation_quality",
+    "target_geometry_match",
+    "source_identity_preservation",
+    "overall_quality",
+)
+
+
+def weighted_average(score_dicts, weights):
+    pairs = [
+        (scores, weight)
+        for scores, weight in zip(score_dicts, weights)
+        if isinstance(scores, dict) and scores and weight > 0
+    ]
+    if not pairs:
+        return {}
+    out = {}
+    for key in SCORE_KEYS:
+        weighted_sum = 0.0
+        total_weight = 0
+        for scores, weight in pairs:
+            if key in scores:
+                weighted_sum += float(scores[key]) * weight
+                total_weight += weight
+        if total_weight > 0:
+            out[key] = round(weighted_sum / total_weight, 4)
+    return out
+
+
+output_root = Path(sys.argv[1])
+summary_paths = sorted((output_root / "logs").glob("worker_*_summary.json"))
+worker_summaries = []
+for path in summary_paths:
+    try:
+        worker_summaries.append(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+score_summaries = [
+    item.get("score_summary", {})
+    for item in worker_summaries
+    if isinstance(item.get("score_summary", {}), dict)
+]
+
+overall_scores = [summary.get("overall_mean", {}) for summary in score_summaries]
+per_step_scores = [summary.get("per_step_mean", {}) for summary in score_summaries]
+trajectory_scores = [summary.get("trajectory_mean", {}) for summary in score_summaries]
+s_goal_scores = [summary.get("s_goal_mean", {}) for summary in score_summaries]
+weights = [int(summary.get("num_samples_with_scores", 0)) for summary in score_summaries]
+
+global_summary = {
+    "scale": "0.0-5.0",
+    "num_workers": len(worker_summaries),
+    "num_samples_with_scores": sum(
+        int(summary.get("num_samples_with_scores", 0))
+        for summary in score_summaries
+    ),
+    "overall_mean": weighted_average(overall_scores, weights),
+    "per_step_mean": weighted_average(per_step_scores, weights),
+    "trajectory_mean": weighted_average(trajectory_scores, weights),
+    "s_goal_mean": weighted_average(s_goal_scores, weights),
+}
+
+summary_path = output_root / "logs" / "score_summary.json"
+summary_path.write_text(json.dumps(global_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"[run_spair71k] score summary: {summary_path}")
+print(f"[run_spair71k] score overall_mean: {global_summary['overall_mean']}")
+PY
