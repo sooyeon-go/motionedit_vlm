@@ -605,7 +605,9 @@ Plan JSON:
 Audit the plan BEFORE any image editing.
 
 Required policy:
-- Pose/deformation/articulation steps must come before angle/size camera steps.
+- If stage_plan.pose_steps=0 or run_pose_stage=false, an angle/size-only plan is VALID.
+  Do NOT require pose/deformation steps when diagnosis says no pose change is needed.
+- When pose steps ARE needed, pose/deformation/articulation steps must come before angle/size camera steps.
 - MotionEdit pose steps use natural descriptive edit prompts.
 - Angle/size steps must use Qwen angle-LoRA prompt format exactly:
   <sks> [azimuth] [elevation] [distance]
@@ -2834,6 +2836,87 @@ def diagnose_stage_plan(
     return analysis, stage_plan, parsed
 
 
+def _is_valid_angle_prompt(instruction: str) -> bool:
+    if not instruction.startswith("<sks> "):
+        return False
+    rest = instruction[len("<sks> ") :]
+    for azimuth in AZIMUTH_BINS:
+        prefix = f"{azimuth} "
+        if not rest.startswith(prefix):
+            continue
+        rest = rest[len(prefix) :]
+        for elevation in ELEVATION_BINS:
+            el_prefix = f"{elevation} "
+            if not rest.startswith(el_prefix):
+                continue
+            distance = rest[len(el_prefix) :]
+            if distance in DISTANCE_BINS:
+                return True
+    return False
+
+
+def validate_plan_structure(
+    stage_plan: StagePlan,
+    all_steps: list[SubInstruction],
+) -> dict[str, bool]:
+    pose_steps = [step for step in all_steps if step.transform_type != "angle_size"]
+    angle_steps = [step for step in all_steps if step.transform_type == "angle_size"]
+
+    if stage_plan.pose_steps <= 0:
+        ordering_ok = len(pose_steps) == 0
+        step_count_ok = len(pose_steps) == 0
+    else:
+        step_count_ok = len(pose_steps) == stage_plan.pose_steps
+        if not angle_steps:
+            ordering_ok = True
+        elif not pose_steps:
+            ordering_ok = False
+        else:
+            last_pose_idx = max(
+                idx for idx, step in enumerate(all_steps) if step.transform_type != "angle_size"
+            )
+            first_angle_idx = min(
+                idx for idx, step in enumerate(all_steps) if step.transform_type == "angle_size"
+            )
+            ordering_ok = last_pose_idx < first_angle_idx
+
+    prompt_format_ok = True
+    for step in pose_steps:
+        if step.instruction.startswith("<sks>"):
+            prompt_format_ok = False
+            break
+    for step in angle_steps:
+        if not _is_valid_angle_prompt(step.instruction):
+            prompt_format_ok = False
+            break
+
+    return {
+        "ordering_ok": ordering_ok,
+        "step_count_ok": step_count_ok,
+        "prompt_format_ok": prompt_format_ok,
+    }
+
+
+def merge_planning_verify(
+    vlm_verify: dict[str, Any],
+    structural_checks: dict[str, bool],
+) -> dict[str, Any]:
+    merged = dict(vlm_verify)
+    for key, value in structural_checks.items():
+        merged[key] = value
+    merged["overall_ok"] = all(
+        bool(merged.get(key, False))
+        for key in (
+            "ordering_ok",
+            "step_count_ok",
+            "prompt_format_ok",
+            "identity_constraints_ok",
+            "shared_parts_ok",
+        )
+    )
+    return merged
+
+
 def verify_planning(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -2968,8 +3051,12 @@ def plan_staged_until_verified(
         )
         plan_payload["pose_raw"] = pose_raw
         plan_payload["planning_attempt"] = attempt
-        last_verify = verify_planning(source_img, target_img, plan_payload, planner_vlm)
+        vlm_verify = verify_planning(source_img, target_img, plan_payload, planner_vlm)
+        structural_checks = validate_plan_structure(stage_plan, all_steps)
+        last_verify = merge_planning_verify(vlm_verify, structural_checks)
         plan_payload["planning_verify"] = last_verify
+        plan_payload["planning_verify_vlm"] = vlm_verify
+        plan_payload["planning_verify_structural"] = structural_checks
 
         plan_path = output_dir / "plan.json"
         plan_path.write_text(json.dumps(plan_payload, indent=2, ensure_ascii=False), encoding="utf-8")
