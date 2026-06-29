@@ -1091,6 +1091,30 @@ def parse_scores(text: str) -> dict[str, float]:
     return scores
 
 
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    """Parse VLM JSON fields that should be integers but may arrive as str/list."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return max(0, int(float(text)))
+        except ValueError:
+            match = re.search(r"\d+", text)
+            return max(0, int(match.group(0))) if match else default
+    if isinstance(value, (list, tuple)):
+        nums = [_coerce_non_negative_int(item, default=-1) for item in value]
+        nums = [num for num in nums if num >= 0]
+        return max(nums) if nums else default
+    return default
+
+
 def extract_shared_parts(analysis_dict: dict[str, Any]) -> list[str]:
     """Parts visible on both source and endpoint that should stay trackable."""
     raw = analysis_dict.get("shared_parts") or []
@@ -1182,7 +1206,7 @@ def build_analysis(parsed: dict[str, Any]) -> Analysis:
 
 def build_step(raw_step: dict[str, Any], fallback_step: int) -> SubInstruction:
     return SubInstruction(
-        step=int(raw_step.get("step", fallback_step)),
+        step=_coerce_non_negative_int(raw_step.get("step", fallback_step), default=fallback_step),
         instruction=str(raw_step["instruction"]),
         transform_type=str(raw_step["transform_type"]),
         affected_parts=list(raw_step.get("affected_parts", ["object"])),
@@ -1219,7 +1243,7 @@ def build_stage_plan(parsed: dict[str, Any], max_pose_steps: int) -> StagePlan:
     object_motion_type = str(raw.get("object_motion_type", "rigid")).lower()
     pose_gap = str(raw.get("pose_gap", "none")).lower()
     groups = [str(item) for item in raw.get("independent_moving_part_groups", []) if item]
-    requested_pose_steps = int(raw.get("pose_steps", 0))
+    requested_pose_steps = _coerce_non_negative_int(raw.get("pose_steps", 0))
 
     if object_motion_type == "rigid" or pose_gap == "none":
         pose_steps = 0
