@@ -34,7 +34,9 @@ SEED="${SEED:-42}"
 MAX_PREALIGN_VERIFY_ATTEMPTS="${MAX_PREALIGN_VERIFY_ATTEMPTS:-0}"
 PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS="${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS:-5}"
 MAX_PLANNING_ATTEMPTS="${MAX_PLANNING_ATTEMPTS:-5}"
-MAX_POSE_STEPS="${MAX_POSE_STEPS:-6}"
+MAX_POSE_STEPS="${MAX_POSE_STEPS:-4}"
+COARSE_ANGLE="${COARSE_ANGLE:-1}"
+MAX_ANGLE_STEPS="${MAX_ANGLE_STEPS:-2}"
 SKIP_S_GOAL="${SKIP_S_GOAL:-0}"
 S_GOAL_MAX_RETRIES="${S_GOAL_MAX_RETRIES:-2}"
 S_GOAL_IDENTITY_THRESHOLD="${S_GOAL_IDENTITY_THRESHOLD:-0.72}"
@@ -78,6 +80,8 @@ echo "[run_spair71k] prealign_verify_attempts = ${MAX_PREALIGN_VERIFY_ATTEMPTS} 
 echo "[run_spair71k] prealign_bruteforce_after = ${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS} (unique flip/rotate VLM pick, typically 8)"
 echo "[run_spair71k] planning_attempts        = ${MAX_PLANNING_ATTEMPTS} (0=unlimited, default 5)"
 echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
+echo "[run_spair71k] coarse_angle             = ${COARSE_ANGLE} (1=front/right/back/left coarse bins, 0=8-bin fine angle)"
+echo "[run_spair71k] max_angle_steps          = ${MAX_ANGLE_STEPS}"
 echo "[run_spair71k] skip_s_goal              = ${SKIP_S_GOAL} (0=S_goal first, 1=direct target path)"
 echo "[run_spair71k] s_goal_max_retries       = ${S_GOAL_MAX_RETRIES}"
 echo "[run_spair71k] s_goal_identity_threshold= ${S_GOAL_IDENTITY_THRESHOLD}"
@@ -119,6 +123,7 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     --prealign_bruteforce_after_attempts "${PREALIGN_BRUTEFORCE_AFTER_ATTEMPTS}"
     --max_planning_attempts "${MAX_PLANNING_ATTEMPTS}"
     --max_pose_steps "${MAX_POSE_STEPS}"
+    --max_angle_steps "${MAX_ANGLE_STEPS}"
     --s_goal_max_retries "${S_GOAL_MAX_RETRIES}"
     --s_goal_identity_threshold "${S_GOAL_IDENTITY_THRESHOLD}"
     --device cuda
@@ -142,6 +147,11 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
   fi
   if [[ "${SKIP_S_GOAL}" == "1" ]]; then
     CMD+=(--skip_s_goal)
+  fi
+  if [[ "${COARSE_ANGLE}" == "1" ]]; then
+    CMD+=(--coarse_angle)
+  else
+    CMD+=(--fine_angle)
   fi
   if [[ -n "${EXTRA_ARGS}" ]]; then
     # shellcheck disable=SC2206

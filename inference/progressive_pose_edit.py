@@ -71,6 +71,12 @@ AZIMUTH_BINS = [
     "left side view",
     "front-left quarter view",
 ]
+CARDINAL_AZIMUTH_BINS = [
+    "front view",
+    "right side view",
+    "back view",
+    "left side view",
+]
 ELEVATION_BINS = [
     "low-angle shot",
     "eye-level shot",
@@ -650,8 +656,8 @@ Decide whether to run:
 
 Use only visible image evidence. Do not use dataset annotations.
 The ENDPOINT geometry match is the final priority. The later progressive steps should
-split this gap into trackable interpolation changes, roughly like 8-10 video-frame
-pose/view differences per step.
+split this gap into coarse, trackable keyframe changes, roughly like a stride-8 video
+sampling gap. Prefer fewer meaningful keyframes over many tiny micro-steps.
 
 Camera prompt vocabulary:
 - azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
@@ -659,12 +665,14 @@ Camera prompt vocabulary:
 - distance: close-up | medium shot | wide shot
 Angle-LoRA prompt format:
 <sks> [azimuth] [elevation] [distance]
+Angle execution is coarse by default: azimuth will be snapped to front/right/back/left
+cardinal views and capped to a small number of large steps.
 
 Pose step policy:
 - rigid object with no movable-pose change: pose_steps=0
-- deformable object: small=1, medium=2-3, large=3-4
-- articulated object: small=1-2, medium=3-4, large=5-6
-- Increase steps when independent moving part groups are many.
+- deformable object: small=1, medium=1-2, large=2-3
+- articulated object: small=1, medium=2-3, large=3-4
+- Increase steps only when independent moving part groups are many and the gap is large.
 - Cap pose_steps at {max_pose_steps}.
 
 Return this exact JSON:
@@ -728,8 +736,10 @@ Instruction style:
 - Natural descriptive edit prompt.
 - Use body/object parts and spatial relations.
 - Preserve source identity/category/texture/material.
-- Each step should be a moderate-small trackable interpolation, like an 8-10 frame
-  pose change in a video: visible progress, no abrupt jump.
+- Each step should be a coarse but trackable interpolation keyframe, like a stride-8
+  pose change in a video: meaningful visible progress, but no abrupt jump.
+- Avoid overly small micro-adjustments; combine minor joint changes when they form one
+  coherent motion keyframe.
 - Keep major parts identifiable across consecutive steps; avoid part swaps, sudden
   disappearances, or topology changes.
 - If ENDPOINT geometry occludes a source-visible part, introduce that visibility
@@ -1253,8 +1263,8 @@ def build_stage_plan(parsed: dict[str, Any], max_pose_steps: int) -> StagePlan:
         pose_steps = requested_pose_steps
         if pose_steps <= 0:
             base = 2 if object_motion_type == "articulated" else 1
-            gap_bonus = {"small": 0, "medium": 2, "large": 3}.get(pose_gap, 1)
-            group_bonus = 2 if len(groups) >= 5 else (1 if len(groups) >= 3 else 0)
+            gap_bonus = {"small": 0, "medium": 1, "large": 2}.get(pose_gap, 1)
+            group_bonus = 1 if pose_gap == "large" and len(groups) >= 4 else 0
             pose_steps = base + gap_bonus + group_bonus
     pose_steps = max(0, min(max_pose_steps, pose_steps))
 
@@ -1295,13 +1305,56 @@ def _linear_path(start: str, end: str, bins: list[str]) -> list[str]:
     return [bins[idx] for idx in range(start_idx, end_idx + step, step)]
 
 
-def generate_angle_steps(stage_plan: StagePlan, start_step: int) -> list[SubInstruction]:
+def _coarse_azimuth(value: str) -> str:
+    """Snap quarter views to broad front/right/back/left camera buckets."""
+    if value in CARDINAL_AZIMUTH_BINS:
+        return value
+    if "right" in value:
+        return "right side view"
+    if "left" in value:
+        return "left side view"
+    if "back" in value:
+        return "back view"
+    return "front view"
+
+
+def _subsample_path(path: list[str], max_transitions: int) -> list[str]:
+    if max_transitions <= 0 or len(path) <= max_transitions + 1:
+        return path
+    last_idx = len(path) - 1
+    sampled = [path[round(last_idx * idx / max_transitions)] for idx in range(max_transitions + 1)]
+    deduped: list[str] = []
+    for item in sampled:
+        if not deduped or deduped[-1] != item:
+            deduped.append(item)
+    if deduped[-1] != path[-1]:
+        deduped.append(path[-1])
+    return deduped
+
+
+def generate_angle_steps(
+    stage_plan: StagePlan,
+    start_step: int,
+    coarse_angle: bool = True,
+    max_angle_steps: int = 2,
+) -> list[SubInstruction]:
     if not stage_plan.run_angle_stage:
         return []
 
-    az_path = _circular_path(stage_plan.source_camera.azimuth, stage_plan.target_camera.azimuth, AZIMUTH_BINS)
-    el_path = _linear_path(stage_plan.source_camera.elevation, stage_plan.target_camera.elevation, ELEVATION_BINS)
-    dist_path = _linear_path(stage_plan.source_camera.distance, stage_plan.target_camera.distance, DISTANCE_BINS)
+    if coarse_angle:
+        source_az = _coarse_azimuth(stage_plan.source_camera.azimuth)
+        target_az = _coarse_azimuth(stage_plan.target_camera.azimuth)
+        az_path = _circular_path(source_az, target_az, CARDINAL_AZIMUTH_BINS)
+        az_path = _subsample_path(az_path, max_angle_steps)
+        el_path = [stage_plan.source_camera.elevation, stage_plan.target_camera.elevation]
+        dist_path = [stage_plan.source_camera.distance, stage_plan.target_camera.distance]
+    else:
+        az_path = _circular_path(stage_plan.source_camera.azimuth, stage_plan.target_camera.azimuth, AZIMUTH_BINS)
+        el_path = _linear_path(stage_plan.source_camera.elevation, stage_plan.target_camera.elevation, ELEVATION_BINS)
+        dist_path = _linear_path(stage_plan.source_camera.distance, stage_plan.target_camera.distance, DISTANCE_BINS)
+        az_path = _subsample_path(az_path, max_angle_steps)
+        el_path = _subsample_path(el_path, max_angle_steps)
+        dist_path = _subsample_path(dist_path, max_angle_steps)
     n_steps = max(len(az_path), len(el_path), len(dist_path)) - 1
     if n_steps <= 0:
         return []
@@ -1309,8 +1362,12 @@ def generate_angle_steps(stage_plan: StagePlan, start_step: int) -> list[SubInst
     steps: list[SubInstruction] = []
     for idx in range(1, n_steps + 1):
         az = az_path[min(idx, len(az_path) - 1)]
-        el = el_path[min(idx, len(el_path) - 1)]
-        dist = dist_path[min(idx, len(dist_path) - 1)]
+        if coarse_angle and idx < n_steps:
+            el = stage_plan.source_camera.elevation
+            dist = stage_plan.source_camera.distance
+        else:
+            el = el_path[min(idx, len(el_path) - 1)]
+            dist = dist_path[min(idx, len(dist_path) - 1)]
         camera = CameraPose(azimuth=az, elevation=el, distance=dist)
         step_num = start_step + idx - 1
         steps.append(
@@ -1320,7 +1377,7 @@ def generate_angle_steps(stage_plan: StagePlan, start_step: int) -> list[SubInst
                 transform_type="angle_size",
                 affected_parts=["object"],
                 expected_change=f"change camera/framing toward {camera.prompt}",
-                magnitude_estimate="small",
+                magnitude_estimate="moderate" if coarse_angle else "small",
                 cumulative_progress=float(idx / n_steps),
                 identity_warning="check_texture",
             )
@@ -3011,6 +3068,8 @@ def plan_staged_until_verified(
     output_dir: Path,
     max_pose_steps: int,
     max_planning_attempts: int,
+    coarse_angle: bool,
+    max_angle_steps: int,
 ) -> tuple[Analysis, StagePlan, list[SubInstruction], dict[str, Any], dict[str, Any]]:
     attempt = 0
     revision_hint = ""
@@ -3035,7 +3094,12 @@ def plan_staged_until_verified(
             output_dir=output_dir,
             revision_hint=revision_hint,
         )
-        angle_steps = generate_angle_steps(stage_plan, start_step=len(pose_steps) + 1)
+        angle_steps = generate_angle_steps(
+            stage_plan,
+            start_step=len(pose_steps) + 1,
+            coarse_angle=coarse_angle,
+            max_angle_steps=max_angle_steps,
+        )
         all_steps = pose_steps + angle_steps
         for idx, step in enumerate(all_steps, start=1):
             step.step = idx
@@ -3051,6 +3115,11 @@ def plan_staged_until_verified(
         )
         plan_payload["pose_raw"] = pose_raw
         plan_payload["planning_attempt"] = attempt
+        plan_payload["angle_mode"] = {
+            "coarse_angle": coarse_angle,
+            "max_angle_steps": max_angle_steps,
+            "azimuth_bins": CARDINAL_AZIMUTH_BINS if coarse_angle else AZIMUTH_BINS,
+        }
         vlm_verify = verify_planning(source_img, target_img, plan_payload, planner_vlm)
         structural_checks = validate_plan_structure(stage_plan, all_steps)
         last_verify = merge_planning_verify(vlm_verify, structural_checks)
@@ -4065,8 +4134,10 @@ def progressive_pose_edit(
     pre_alignment: Optional[PreAlignDecision] = None,
     skip_trajectory_repair: bool = False,
     max_trajectory_repairs: int = 2,
-    max_pose_steps: int = 6,
+    max_pose_steps: int = 4,
     max_planning_attempts: int = 0,
+    coarse_angle: bool = True,
+    max_angle_steps: int = 2,
     skip_s_goal: bool = False,
     s_goal_max_retries: int = 2,
     s_goal_identity_threshold: float = 0.72,
@@ -4105,6 +4176,8 @@ def progressive_pose_edit(
         output_dir=output_dir,
         max_pose_steps=max_pose_steps,
         max_planning_attempts=max_planning_attempts,
+        coarse_angle=coarse_angle,
+        max_angle_steps=max_angle_steps,
     )
     raw_plan["planning_target"] = planning_target_name
     raw_plan["s_goal"] = s_goal_payload
@@ -4362,8 +4435,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_pose_steps",
         type=int,
-        default=6,
-        help="Maximum MotionEdit pose/deformation steps from staged diagnosis.",
+        default=4,
+        help="Maximum MotionEdit pose/deformation keyframe steps from staged diagnosis.",
+    )
+    parser.add_argument(
+        "--coarse_angle",
+        dest="coarse_angle",
+        action="store_true",
+        default=True,
+        help="Use coarse front/right/back/left angle keyframes (default).",
+    )
+    parser.add_argument(
+        "--fine_angle",
+        dest="coarse_angle",
+        action="store_false",
+        help="Use the full 8-bin azimuth path for angle keyframes.",
+    )
+    parser.add_argument(
+        "--max_angle_steps",
+        type=int,
+        default=2,
+        help="Maximum number of angle/size keyframe steps.",
     )
     parser.add_argument(
         "--max_planning_attempts",
@@ -4636,6 +4728,8 @@ def main() -> None:
         max_trajectory_repairs=args.max_trajectory_repairs,
         max_pose_steps=args.max_pose_steps,
         max_planning_attempts=args.max_planning_attempts,
+        coarse_angle=args.coarse_angle,
+        max_angle_steps=args.max_angle_steps,
         skip_s_goal=args.skip_s_goal,
         s_goal_max_retries=args.s_goal_max_retries,
         s_goal_identity_threshold=args.s_goal_identity_threshold,

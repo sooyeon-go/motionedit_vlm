@@ -212,6 +212,8 @@ def run_single_pair(
         max_trajectory_repairs=args.max_trajectory_repairs,
         max_pose_steps=args.max_pose_steps,
         max_planning_attempts=args.max_planning_attempts,
+        coarse_angle=args.coarse_angle,
+        max_angle_steps=args.max_angle_steps,
         skip_s_goal=args.skip_s_goal,
         s_goal_max_retries=args.s_goal_max_retries,
         s_goal_identity_threshold=args.s_goal_identity_threshold,
@@ -344,8 +346,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_pre_align_rotation", type=float, default=30.0)
     parser.add_argument("--max_prealign_verify_attempts", type=int, default=0)
     parser.add_argument("--prealign_bruteforce_after_attempts", type=int, default=5)
-    parser.add_argument("--max_pose_steps", type=int, default=6)
+    parser.add_argument("--max_pose_steps", type=int, default=4)
     parser.add_argument("--max_planning_attempts", type=int, default=0)
+    parser.add_argument("--coarse_angle", dest="coarse_angle", action="store_true", default=True)
+    parser.add_argument("--fine_angle", dest="coarse_angle", action="store_false")
+    parser.add_argument("--max_angle_steps", type=int, default=2)
     parser.add_argument("--skip_s_goal", action="store_true")
     parser.add_argument("--s_goal_max_retries", type=int, default=2)
     parser.add_argument("--s_goal_identity_threshold", type=float, default=0.72)
