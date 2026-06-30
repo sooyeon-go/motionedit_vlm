@@ -25,7 +25,7 @@ cd "${REPO_ROOT}"
 
 GPU_IDS="${GPU_IDS:-0}"
 DATASET_ROOT="${DATASET_ROOT:-/data/shared-vilab/datasets/spair-71k/SPair-71k}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit_sgoal}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/spair71k_progressive_pose_edit}"
 # Processed in fixed order: test -> val -> trn (train), regardless of list order here.
 SPLITS="${SPLITS:-test,val,trn}"
 N_STEPS="${N_STEPS:-5}"
@@ -37,9 +37,6 @@ MAX_PLANNING_ATTEMPTS="${MAX_PLANNING_ATTEMPTS:-5}"
 MAX_POSE_STEPS="${MAX_POSE_STEPS:-4}"
 COARSE_ANGLE="${COARSE_ANGLE:-1}"
 MAX_ANGLE_STEPS="${MAX_ANGLE_STEPS:-2}"
-SKIP_S_GOAL="${SKIP_S_GOAL:-0}"
-S_GOAL_MAX_RETRIES="${S_GOAL_MAX_RETRIES:-2}"
-S_GOAL_IDENTITY_THRESHOLD="${S_GOAL_IDENTITY_THRESHOLD:-0.72}"
 LIMIT="${LIMIT:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 INTERLEAVE_CLASSES="${INTERLEAVE_CLASSES:-1}"
@@ -82,9 +79,6 @@ echo "[run_spair71k] planning_attempts        = ${MAX_PLANNING_ATTEMPTS} (0=unli
 echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
 echo "[run_spair71k] coarse_angle             = ${COARSE_ANGLE} (1=front/right/back/left coarse bins, 0=8-bin fine angle)"
 echo "[run_spair71k] max_angle_steps          = ${MAX_ANGLE_STEPS}"
-echo "[run_spair71k] skip_s_goal              = ${SKIP_S_GOAL} (0=S_goal first, 1=direct target path)"
-echo "[run_spair71k] s_goal_max_retries       = ${S_GOAL_MAX_RETRIES}"
-echo "[run_spair71k] s_goal_identity_threshold= ${S_GOAL_IDENTITY_THRESHOLD}"
 echo "[run_spair71k] log_to_file              = ${LOG_TO_FILE} (0=terminal only, 1=terminal+logs)"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
@@ -124,8 +118,6 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     --max_planning_attempts "${MAX_PLANNING_ATTEMPTS}"
     --max_pose_steps "${MAX_POSE_STEPS}"
     --max_angle_steps "${MAX_ANGLE_STEPS}"
-    --s_goal_max_retries "${S_GOAL_MAX_RETRIES}"
-    --s_goal_identity_threshold "${S_GOAL_IDENTITY_THRESHOLD}"
     --device cuda
   )
 
@@ -144,9 +136,6 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
   fi
   if [[ "${DRY_RUN}" == "1" ]]; then
     CMD+=(--dry_run)
-  fi
-  if [[ "${SKIP_S_GOAL}" == "1" ]]; then
-    CMD+=(--skip_s_goal)
   fi
   if [[ "${COARSE_ANGLE}" == "1" ]]; then
     CMD+=(--coarse_angle)
@@ -247,7 +236,6 @@ score_summaries = [
 overall_scores = [summary.get("overall_mean", {}) for summary in score_summaries]
 per_step_scores = [summary.get("per_step_mean", {}) for summary in score_summaries]
 trajectory_scores = [summary.get("trajectory_mean", {}) for summary in score_summaries]
-s_goal_scores = [summary.get("s_goal_mean", {}) for summary in score_summaries]
 weights = [int(summary.get("num_samples_with_scores", 0)) for summary in score_summaries]
 
 global_summary = {
@@ -260,7 +248,6 @@ global_summary = {
     "overall_mean": weighted_average(overall_scores, weights),
     "per_step_mean": weighted_average(per_step_scores, weights),
     "trajectory_mean": weighted_average(trajectory_scores, weights),
-    "s_goal_mean": weighted_average(s_goal_scores, weights),
 }
 
 summary_path = output_root / "logs" / "score_summary.json"

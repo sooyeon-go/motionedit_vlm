@@ -124,7 +124,6 @@ def aggregate_score_summaries(score_summaries: list[dict[str, Any]]) -> dict[str
     overall_scores: list[dict[str, float]] = []
     per_step_scores: list[dict[str, float]] = []
     trajectory_scores: list[dict[str, float]] = []
-    s_goal_scores: list[dict[str, float]] = []
 
     for summary in score_summaries:
         if not summary:
@@ -132,15 +131,12 @@ def aggregate_score_summaries(score_summaries: list[dict[str, Any]]) -> dict[str
         overall = summary.get("overall_mean", {})
         per_step = summary.get("per_step_mean", {})
         trajectory = summary.get("trajectory", {})
-        s_goal = summary.get("s_goal", {})
         if isinstance(overall, dict) and overall:
             overall_scores.append(overall)
         if isinstance(per_step, dict) and per_step:
             per_step_scores.append(per_step)
         if isinstance(trajectory, dict) and trajectory:
             trajectory_scores.append(trajectory)
-        if isinstance(s_goal, dict) and s_goal:
-            s_goal_scores.append(s_goal)
 
     return {
         "scale": "0.0-5.0",
@@ -148,7 +144,6 @@ def aggregate_score_summaries(score_summaries: list[dict[str, Any]]) -> dict[str
         "overall_mean": ppe.average_score_dicts(overall_scores),
         "per_step_mean": ppe.average_score_dicts(per_step_scores),
         "trajectory_mean": ppe.average_score_dicts(trajectory_scores),
-        "s_goal_mean": ppe.average_score_dicts(s_goal_scores),
     }
 
 
@@ -214,9 +209,6 @@ def run_single_pair(
         max_planning_attempts=args.max_planning_attempts,
         coarse_angle=args.coarse_angle,
         max_angle_steps=args.max_angle_steps,
-        skip_s_goal=args.skip_s_goal,
-        s_goal_max_retries=args.s_goal_max_retries,
-        s_goal_identity_threshold=args.s_goal_identity_threshold,
     )
 
     ppe.save_image(result.final_img, output_dir / "final.png")
@@ -351,9 +343,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coarse_angle", dest="coarse_angle", action="store_true", default=True)
     parser.add_argument("--fine_angle", dest="coarse_angle", action="store_false")
     parser.add_argument("--max_angle_steps", type=int, default=2)
-    parser.add_argument("--skip_s_goal", action="store_true")
-    parser.add_argument("--s_goal_max_retries", type=int, default=2)
-    parser.add_argument("--s_goal_identity_threshold", type=float, default=0.72)
     parser.add_argument("--quiet", action="store_true")
     return parser
 
