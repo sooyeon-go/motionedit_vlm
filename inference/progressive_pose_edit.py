@@ -12,6 +12,7 @@ Default model layout on shared storage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -1523,6 +1524,17 @@ class MotionNFTEditor:
         if hasattr(self.pipe, "enable_lora"):
             self.pipe.enable_lora()
 
+    def _disable_lora_adapters(self) -> None:
+        if hasattr(self.pipe, "disable_lora"):
+            self.pipe.disable_lora()
+            return
+        if self.loaded_adapters:
+            self._enable_lora_adapters()
+            adapters = sorted(self.loaded_adapters)
+            self.pipe.set_adapters(adapters, adapter_weights=[0.0] * len(adapters))
+            return
+        raise RuntimeError("Base Qwen ablation requires loaded adapters or disable_lora().")
+
     @torch.no_grad()
     def edit(
         self,
@@ -1531,12 +1543,15 @@ class MotionNFTEditor:
         step_seed: int,
         adapter: str = "motion",
     ) -> Image.Image:
-        if adapter not in self.loaded_adapters:
-            if adapter == "angle":
-                log("[edit] Angle adapter unavailable; falling back to motion adapter.")
-            adapter = "motion"
-        self._enable_lora_adapters()
-        self.pipe.set_adapters([adapter], adapter_weights=[1.0])
+        if adapter == "base":
+            self._disable_lora_adapters()
+        else:
+            if adapter not in self.loaded_adapters:
+                if adapter == "angle":
+                    log("[edit] Angle adapter unavailable; falling back to motion adapter.")
+                adapter = "motion"
+            self._enable_lora_adapters()
+            self.pipe.set_adapters([adapter], adapter_weights=[1.0])
         generator_device = "cuda" if self.device.startswith("cuda") else "cpu"
         generator = torch.Generator(device=generator_device).manual_seed(self.seed + step_seed)
         image = self.pipe(
@@ -3539,6 +3554,7 @@ def execute_one_step(
     output_dir: Path,
     shared_parts: list[str],
     attempt_prefix: str = "",
+    angle_step_adapter: str = "angle",
 ) -> tuple[Image.Image, SubInstruction, VerifyResult]:
     retry_count = 0
     edited: Optional[Image.Image] = None
@@ -3551,7 +3567,7 @@ def execute_one_step(
         )
         t_edit = time.time()
         log("  editing with MotionNFT...")
-        adapter = "angle" if current_step.transform_type == "angle_size" else "motion"
+        adapter = angle_step_adapter if current_step.transform_type == "angle_size" else "motion"
         edited = editor.edit(
             source_img=before,
             instruction=current_step.instruction,
@@ -3587,7 +3603,7 @@ def execute_one_step(
             log(f"[step {step_idx}] max retries reached; keeping last attempt")
             break
         if current_step.transform_type == "angle_size":
-            log("[replan] Angle-LoRA step keeps fixed <sks> prompt; retrying with next seed.")
+            log("[replan] Angle/size step keeps fixed <sks> prompt; retrying with next seed.")
             retry_count += 1
             continue
         if planner_vlm is None:
@@ -3621,6 +3637,7 @@ def execute_progressive(
     skip_vlm_verify: bool,
     output_dir: Path,
     shared_parts: Optional[list[str]] = None,
+    angle_step_adapter: str = "angle",
 ) -> tuple[list[Image.Image], list[SubInstruction], list[VerifyResult]]:
     shared_parts = shared_parts or []
     trajectory = [source_img]
@@ -3649,6 +3666,7 @@ def execute_progressive(
             skip_vlm_verify=skip_vlm_verify,
             output_dir=output_dir,
             shared_parts=shared_parts,
+            angle_step_adapter=angle_step_adapter,
         )
         trajectory.append(edited)
         final_steps.append(current_step)
@@ -3675,6 +3693,7 @@ def re_execute_steps_from(
     output_dir: Path,
     shared_parts: list[str],
     attempt_prefix: str,
+    angle_step_adapter: str = "angle",
 ) -> tuple[list[Image.Image], list[SubInstruction], list[VerifyResult]]:
     if start_step < 1 or start_step > len(final_steps):
         raise ValueError(f"start_step must be in [1, {len(final_steps)}], got {start_step}")
@@ -3700,6 +3719,7 @@ def re_execute_steps_from(
             output_dir=output_dir,
             shared_parts=shared_parts,
             attempt_prefix=attempt_prefix,
+            angle_step_adapter=angle_step_adapter,
         )
         updated_trajectory.append(edited)
         updated_steps[step_idx - 1] = current_step
@@ -3726,6 +3746,7 @@ def repair_trajectory(
     skip_trajectory_vlm: bool,
     trajectory_flow_ratio: float,
     max_trajectory_repairs: int,
+    angle_step_adapter: str = "angle",
 ) -> tuple[
     list[Image.Image],
     list[SubInstruction],
@@ -3800,6 +3821,7 @@ def repair_trajectory(
             output_dir=output_dir,
             shared_parts=shared_parts,
             attempt_prefix=attempt_prefix,
+            angle_step_adapter=angle_step_adapter,
         )
 
         trajectory_verify = verify_trajectory(
@@ -3836,7 +3858,7 @@ def repair_trajectory(
     return current_trajectory, current_steps, current_verify, trajectory_verify, repair_log
 
 
-def progressive_pose_edit(
+def execute_planned_pipeline(
     source_img: Image.Image,
     target_img: Image.Image,
     planner_vlm: QwenVLMClient,
@@ -3853,29 +3875,17 @@ def progressive_pose_edit(
     pre_alignment: Optional[PreAlignDecision] = None,
     skip_trajectory_repair: bool = False,
     max_trajectory_repairs: int = 2,
-    max_pose_steps: int = 4,
-    max_planning_attempts: int = 0,
-    coarse_angle: bool = True,
-    max_angle_steps: int = 2,
+    analysis: Optional[Analysis] = None,
+    stage_plan: Optional[StagePlan] = None,
+    steps: Optional[list[SubInstruction]] = None,
+    planning_verify: Optional[dict[str, Any]] = None,
+    angle_step_adapter: str = "angle",
 ) -> PipelineResult:
-    log("\n========== Phase 0: Staged Planning (target=target) ==========")
-    analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
-        source_img=source_img,
-        target_img=target_img,
-        planner_vlm=planner_vlm,
-        output_dir=output_dir,
-        max_pose_steps=max_pose_steps,
-        max_planning_attempts=max_planning_attempts,
-        coarse_angle=coarse_angle,
-        max_angle_steps=max_angle_steps,
-    )
-    raw_plan["planning_target"] = "target"
-    (output_dir / "plan.json").write_text(
-        json.dumps(raw_plan, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
+    if analysis is None or stage_plan is None or steps is None:
+        raise ValueError("execute_planned_pipeline requires analysis, stage_plan, and steps.")
+    planning_verify = planning_verify or {}
     log("\n========== Phase 1: Progressive Execution (Pose -> Angle/Size) ==========")
+    log(f"[execute] angle_step_adapter={angle_step_adapter}")
     if not steps:
         log("[execute] No pose or angle/size edits needed; keeping source as final.")
         trajectory = [source_img]
@@ -3897,6 +3907,7 @@ def progressive_pose_edit(
             skip_vlm_verify=skip_vlm_verify,
             output_dir=output_dir,
             shared_parts=analysis.shared_parts,
+            angle_step_adapter=angle_step_adapter,
         )
 
     log("\n========== Phase 1.5: Trajectory Verify ==========")
@@ -3937,6 +3948,7 @@ def progressive_pose_edit(
             skip_trajectory_vlm=skip_trajectory_vlm,
             trajectory_flow_ratio=trajectory_flow_ratio,
             max_trajectory_repairs=max_trajectory_repairs,
+            angle_step_adapter=angle_step_adapter,
         )
     elif skip_trajectory_repair:
         log("[trajectory-repair] Skipped (--skip_trajectory_repair)")
@@ -3960,6 +3972,70 @@ def progressive_pose_edit(
         planning_verify=planning_verify,
         trajectory_verify=trajectory_verify,
         trajectory_repair=trajectory_repair,
+    )
+
+
+def progressive_pose_edit(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    editor: MotionNFTEditor,
+    flow_estimator: UniMatchFlowEstimator,
+    identity_scorer: DINOv2IdentityScorer,
+    output_dir: Path,
+    n_steps: int = 5,
+    max_retries: int = 2,
+    flow_threshold: float = 0.5,
+    skip_vlm_verify: bool = False,
+    skip_trajectory_vlm: bool = False,
+    trajectory_flow_ratio: float = 4.0,
+    pre_alignment: Optional[PreAlignDecision] = None,
+    skip_trajectory_repair: bool = False,
+    max_trajectory_repairs: int = 2,
+    max_pose_steps: int = 4,
+    max_planning_attempts: int = 0,
+    coarse_angle: bool = True,
+    max_angle_steps: int = 2,
+    angle_step_adapter: str = "angle",
+) -> PipelineResult:
+    log("\n========== Phase 0: Staged Planning (target=target) ==========")
+    analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
+        source_img=source_img,
+        target_img=target_img,
+        planner_vlm=planner_vlm,
+        output_dir=output_dir,
+        max_pose_steps=max_pose_steps,
+        max_planning_attempts=max_planning_attempts,
+        coarse_angle=coarse_angle,
+        max_angle_steps=max_angle_steps,
+    )
+    raw_plan["planning_target"] = "target"
+    (output_dir / "plan.json").write_text(
+        json.dumps(raw_plan, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return execute_planned_pipeline(
+        source_img=source_img,
+        target_img=target_img,
+        planner_vlm=planner_vlm,
+        editor=editor,
+        flow_estimator=flow_estimator,
+        identity_scorer=identity_scorer,
+        output_dir=output_dir,
+        n_steps=n_steps,
+        max_retries=max_retries,
+        flow_threshold=flow_threshold,
+        skip_vlm_verify=skip_vlm_verify,
+        skip_trajectory_vlm=skip_trajectory_vlm,
+        trajectory_flow_ratio=trajectory_flow_ratio,
+        pre_alignment=pre_alignment,
+        skip_trajectory_repair=skip_trajectory_repair,
+        max_trajectory_repairs=max_trajectory_repairs,
+        analysis=analysis,
+        stage_plan=stage_plan,
+        steps=steps,
+        planning_verify=planning_verify,
+        angle_step_adapter=angle_step_adapter,
     )
 
 
@@ -4152,6 +4228,14 @@ def parse_args() -> argparse.Namespace:
         help="Retry planning until verified; 0 means unlimited.",
     )
     parser.add_argument(
+        "--compare_angle_lora",
+        action="store_true",
+        help=(
+            "Plan once, then save two executions under angle_lora/ and "
+            "base_qwen_angle/. The latter disables LoRA only for angle/size steps."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable verbose progress logs (tqdm bar still shown).",
@@ -4262,6 +4346,137 @@ def serializable_result(
     return payload
 
 
+def write_pipeline_artifacts(output_dir: Path, result: PipelineResult) -> dict[str, Any]:
+    save_image(result.final_img, output_dir / "final.png")
+    final_folder = export_final_folder(output_dir, result)
+    serialized = serializable_result(result, final_folder=final_folder)
+    (output_dir / "result.json").write_text(
+        json.dumps(serialized, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return serialized
+
+
+def progressive_pose_edit_angle_lora_comparison(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    planner_vlm: QwenVLMClient,
+    editor: MotionNFTEditor,
+    flow_estimator: UniMatchFlowEstimator,
+    identity_scorer: DINOv2IdentityScorer,
+    output_dir: Path,
+    n_steps: int = 5,
+    max_retries: int = 2,
+    flow_threshold: float = 0.5,
+    skip_vlm_verify: bool = False,
+    skip_trajectory_vlm: bool = False,
+    trajectory_flow_ratio: float = 4.0,
+    pre_alignment: Optional[PreAlignDecision] = None,
+    skip_trajectory_repair: bool = False,
+    max_trajectory_repairs: int = 2,
+    max_pose_steps: int = 4,
+    max_planning_attempts: int = 0,
+    coarse_angle: bool = True,
+    max_angle_steps: int = 2,
+) -> dict[str, Any]:
+    log("\n========== Phase 0: Shared Staged Planning (target=target) ==========")
+    analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
+        source_img=source_img,
+        target_img=target_img,
+        planner_vlm=planner_vlm,
+        output_dir=output_dir,
+        max_pose_steps=max_pose_steps,
+        max_planning_attempts=max_planning_attempts,
+        coarse_angle=coarse_angle,
+        max_angle_steps=max_angle_steps,
+    )
+    raw_plan["planning_target"] = "target"
+    raw_plan["comparison_mode"] = "angle_lora_vs_base_qwen_angle"
+    (output_dir / "plan.json").write_text(
+        json.dumps(raw_plan, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    variants = [
+        ("angle_lora", "angle", "Angle/size steps use the trained angle LoRA."),
+        (
+            "base_qwen_angle",
+            "base",
+            "Angle/size steps disable all LoRA adapters and use base Qwen Image Edit.",
+        ),
+    ]
+    manifest: dict[str, Any] = {
+        "mode": "angle_lora_vs_base_qwen_angle",
+        "shared_plan": "plan.json",
+        "variants": {},
+    }
+
+    for variant_name, angle_step_adapter, description in variants:
+        variant_dir = output_dir / variant_name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        log(f"\n========== Comparison Variant: {variant_name} ==========")
+        save_image(source_img, variant_dir / "source.png")
+        save_image(target_img, variant_dir / "target.png")
+        save_image(source_img, variant_dir / "step_00.png")
+        variant_plan = dict(raw_plan)
+        variant_plan["execution_variant"] = {
+            "name": variant_name,
+            "angle_step_adapter": angle_step_adapter,
+            "description": description,
+        }
+        (variant_dir / "plan.json").write_text(
+            json.dumps(variant_plan, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        result = execute_planned_pipeline(
+            source_img=source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=variant_dir,
+            n_steps=n_steps,
+            max_retries=max_retries,
+            flow_threshold=flow_threshold,
+            skip_vlm_verify=skip_vlm_verify,
+            skip_trajectory_vlm=skip_trajectory_vlm,
+            trajectory_flow_ratio=trajectory_flow_ratio,
+            pre_alignment=pre_alignment,
+            skip_trajectory_repair=skip_trajectory_repair,
+            max_trajectory_repairs=max_trajectory_repairs,
+            analysis=copy.deepcopy(analysis),
+            stage_plan=copy.deepcopy(stage_plan),
+            steps=copy.deepcopy(steps),
+            planning_verify=copy.deepcopy(planning_verify),
+            angle_step_adapter=angle_step_adapter,
+        )
+        serialized = write_pipeline_artifacts(variant_dir, result)
+        manifest["variants"][variant_name] = {
+            "description": description,
+            "angle_step_adapter": angle_step_adapter,
+            "output_dir": variant_name,
+            "result": f"{variant_name}/result.json",
+            "final": f"{variant_name}/final.png",
+            "final_folder": f"{variant_name}/final",
+            "trajectory_ok": (
+                result.trajectory_verify.overall_ok
+                if result.trajectory_verify is not None
+                else None
+            ),
+            "score_summary": serialized.get("score_summary", {}),
+        }
+        if variant_name == "angle_lora":
+            save_image(result.final_img, output_dir / "final.png")
+            manifest["score_summary"] = serialized.get("score_summary", {})
+
+    (output_dir / "result.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def main() -> None:
     global VERBOSE
     args = parse_args()
@@ -4366,42 +4581,62 @@ def main() -> None:
     log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
 
     pipeline_t0 = time.time()
-    result = progressive_pose_edit(
-        source_img=aligned_source_img,
-        target_img=target_img,
-        planner_vlm=planner_vlm,
-        editor=editor,
-        flow_estimator=flow_estimator,
-        identity_scorer=identity_scorer,
-        output_dir=output_dir,
-        n_steps=args.n_steps,
-        max_retries=args.max_retries,
-        flow_threshold=args.flow_threshold,
-        skip_vlm_verify=args.skip_vlm_verify,
-        skip_trajectory_vlm=args.skip_trajectory_vlm,
-        trajectory_flow_ratio=args.trajectory_flow_ratio,
-        pre_alignment=pre_alignment,
-        skip_trajectory_repair=args.skip_trajectory_repair,
-        max_trajectory_repairs=args.max_trajectory_repairs,
-        max_pose_steps=args.max_pose_steps,
-        max_planning_attempts=args.max_planning_attempts,
-        coarse_angle=args.coarse_angle,
-        max_angle_steps=args.max_angle_steps,
-    )
+    if args.compare_angle_lora:
+        log("\n[pipeline] Running angle LoRA comparison mode")
+        progressive_pose_edit_angle_lora_comparison(
+            source_img=aligned_source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            n_steps=args.n_steps,
+            max_retries=args.max_retries,
+            flow_threshold=args.flow_threshold,
+            skip_vlm_verify=args.skip_vlm_verify,
+            skip_trajectory_vlm=args.skip_trajectory_vlm,
+            trajectory_flow_ratio=args.trajectory_flow_ratio,
+            pre_alignment=pre_alignment,
+            skip_trajectory_repair=args.skip_trajectory_repair,
+            max_trajectory_repairs=args.max_trajectory_repairs,
+            max_pose_steps=args.max_pose_steps,
+            max_planning_attempts=args.max_planning_attempts,
+            coarse_angle=args.coarse_angle,
+            max_angle_steps=args.max_angle_steps,
+        )
+    else:
+        result = progressive_pose_edit(
+            source_img=aligned_source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            n_steps=args.n_steps,
+            max_retries=args.max_retries,
+            flow_threshold=args.flow_threshold,
+            skip_vlm_verify=args.skip_vlm_verify,
+            skip_trajectory_vlm=args.skip_trajectory_vlm,
+            trajectory_flow_ratio=args.trajectory_flow_ratio,
+            pre_alignment=pre_alignment,
+            skip_trajectory_repair=args.skip_trajectory_repair,
+            max_trajectory_repairs=args.max_trajectory_repairs,
+            max_pose_steps=args.max_pose_steps,
+            max_planning_attempts=args.max_planning_attempts,
+            coarse_angle=args.coarse_angle,
+            max_angle_steps=args.max_angle_steps,
+        )
+        log("\n[output] Writing final artifacts")
+        write_pipeline_artifacts(output_dir, result)
     log(f"\n[pipeline] Total runtime: {time.time() - pipeline_t0:.1f}s")
-
-    log("\n[output] Writing final artifacts")
-    save_image(result.final_img, output_dir / "final.png")
-    final_folder = export_final_folder(output_dir, result)
-    result_path = output_dir / "result.json"
-    result_path.write_text(
-        json.dumps(serializable_result(result, final_folder=final_folder), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    log(f"  saved {result_path}")
+    log(f"  saved {output_dir / 'result.json'}")
     log(f"\nDone. Outputs in {output_dir}")
     log("  step_00.png .. step_NN.png  — full editing trajectory (debug/log)")
     log("  final/                      — source + interpolation + final only")
+    log("  angle_lora/                 — comparison variant with angle LoRA (if enabled)")
+    log("  base_qwen_angle/            — comparison variant with base Qwen angle steps (if enabled)")
     log("  plan.json                   — VLM editing plan")
     log("  trajectory_verify.json      — flow + VLM trajectory continuity")
     log("  trajectory_repair.json      — suspect-step cascade repair log (if run)")

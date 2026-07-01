@@ -188,37 +188,57 @@ def run_single_pair(
         ppe.save_image(aligned_source_img, output_dir / "aligned_source.png")
         ppe.save_image(aligned_source_img, output_dir / "step_00.png")
 
-    result = ppe.progressive_pose_edit(
-        source_img=aligned_source_img,
-        target_img=target_img,
-        planner_vlm=planner_vlm,
-        editor=editor,
-        flow_estimator=flow_estimator,
-        identity_scorer=identity_scorer,
-        output_dir=output_dir,
-        n_steps=args.n_steps,
-        max_retries=args.max_retries,
-        flow_threshold=args.flow_threshold,
-        skip_vlm_verify=args.skip_vlm_verify,
-        skip_trajectory_vlm=args.skip_trajectory_vlm,
-        trajectory_flow_ratio=args.trajectory_flow_ratio,
-        pre_alignment=pre_alignment,
-        skip_trajectory_repair=args.skip_trajectory_repair,
-        max_trajectory_repairs=args.max_trajectory_repairs,
-        max_pose_steps=args.max_pose_steps,
-        max_planning_attempts=args.max_planning_attempts,
-        coarse_angle=args.coarse_angle,
-        max_angle_steps=args.max_angle_steps,
-    )
-
-    ppe.save_image(result.final_img, output_dir / "final.png")
-    final_folder = ppe.export_final_folder(output_dir, result)
-    result_path = output_dir / "result.json"
-    serialized_result = ppe.serializable_result(result, final_folder=final_folder)
-    result_path.write_text(
-        json.dumps(serialized_result, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if args.compare_angle_lora:
+        serialized_result = ppe.progressive_pose_edit_angle_lora_comparison(
+            source_img=aligned_source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            n_steps=args.n_steps,
+            max_retries=args.max_retries,
+            flow_threshold=args.flow_threshold,
+            skip_vlm_verify=args.skip_vlm_verify,
+            skip_trajectory_vlm=args.skip_trajectory_vlm,
+            trajectory_flow_ratio=args.trajectory_flow_ratio,
+            pre_alignment=pre_alignment,
+            skip_trajectory_repair=args.skip_trajectory_repair,
+            max_trajectory_repairs=args.max_trajectory_repairs,
+            max_pose_steps=args.max_pose_steps,
+            max_planning_attempts=args.max_planning_attempts,
+            coarse_angle=args.coarse_angle,
+            max_angle_steps=args.max_angle_steps,
+        )
+        trajectory_ok = serialized_result.get("variants", {}).get("angle_lora", {}).get("trajectory_ok")
+    else:
+        result = ppe.progressive_pose_edit(
+            source_img=aligned_source_img,
+            target_img=target_img,
+            planner_vlm=planner_vlm,
+            editor=editor,
+            flow_estimator=flow_estimator,
+            identity_scorer=identity_scorer,
+            output_dir=output_dir,
+            n_steps=args.n_steps,
+            max_retries=args.max_retries,
+            flow_threshold=args.flow_threshold,
+            skip_vlm_verify=args.skip_vlm_verify,
+            skip_trajectory_vlm=args.skip_trajectory_vlm,
+            trajectory_flow_ratio=args.trajectory_flow_ratio,
+            pre_alignment=pre_alignment,
+            skip_trajectory_repair=args.skip_trajectory_repair,
+            max_trajectory_repairs=args.max_trajectory_repairs,
+            max_pose_steps=args.max_pose_steps,
+            max_planning_attempts=args.max_planning_attempts,
+            coarse_angle=args.coarse_angle,
+            max_angle_steps=args.max_angle_steps,
+        )
+        serialized_result = ppe.write_pipeline_artifacts(output_dir, result)
+        trajectory_ok = (
+            result.trajectory_verify.overall_ok if result.trajectory_verify is not None else None
+        )
 
     elapsed = time.time() - started
     return {
@@ -229,9 +249,7 @@ def run_single_pair(
         "category": pair.category,
         "output_dir": str(output_dir),
         "elapsed_sec": round(elapsed, 2),
-        "trajectory_ok": (
-            result.trajectory_verify.overall_ok if result.trajectory_verify is not None else None
-        ),
+        "trajectory_ok": trajectory_ok,
         "score_summary": serialized_result.get("score_summary", {}),
     }
 
@@ -343,6 +361,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coarse_angle", dest="coarse_angle", action="store_true", default=True)
     parser.add_argument("--fine_angle", dest="coarse_angle", action="store_false")
     parser.add_argument("--max_angle_steps", type=int, default=2)
+    parser.add_argument("--compare_angle_lora", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
 

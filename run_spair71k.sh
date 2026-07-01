@@ -37,6 +37,7 @@ MAX_PLANNING_ATTEMPTS="${MAX_PLANNING_ATTEMPTS:-5}"
 MAX_POSE_STEPS="${MAX_POSE_STEPS:-4}"
 COARSE_ANGLE="${COARSE_ANGLE:-1}"
 MAX_ANGLE_STEPS="${MAX_ANGLE_STEPS:-2}"
+COMPARE_ANGLE_LORA="${COMPARE_ANGLE_LORA:-0}"
 LIMIT="${LIMIT:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 INTERLEAVE_CLASSES="${INTERLEAVE_CLASSES:-1}"
@@ -79,6 +80,7 @@ echo "[run_spair71k] planning_attempts        = ${MAX_PLANNING_ATTEMPTS} (0=unli
 echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
 echo "[run_spair71k] coarse_angle             = ${COARSE_ANGLE} (1=front/right/back/left coarse bins, 0=8-bin fine angle)"
 echo "[run_spair71k] max_angle_steps          = ${MAX_ANGLE_STEPS}"
+echo "[run_spair71k] compare_angle_lora       = ${COMPARE_ANGLE_LORA} (1=angle LoRA vs base Qwen angle-step ablation)"
 echo "[run_spair71k] log_to_file              = ${LOG_TO_FILE} (0=terminal only, 1=terminal+logs)"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
@@ -141,6 +143,9 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
     CMD+=(--coarse_angle)
   else
     CMD+=(--fine_angle)
+  fi
+  if [[ "${COMPARE_ANGLE_LORA}" == "1" ]]; then
+    CMD+=(--compare_angle_lora)
   fi
   if [[ -n "${EXTRA_ARGS}" ]]; then
     # shellcheck disable=SC2206
