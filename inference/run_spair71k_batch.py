@@ -154,6 +154,7 @@ def run_single_pair(
     editor: ppe.MotionNFTEditor,
     flow_estimator: ppe.UniMatchFlowEstimator,
     identity_scorer: ppe.DINOv2IdentityScorer,
+    orient_anything: Optional[ppe.OrientAnythingClient],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     started = time.time()
@@ -210,6 +211,8 @@ def run_single_pair(
             max_planning_attempts=args.max_planning_attempts,
             coarse_angle=args.coarse_angle,
             max_angle_steps=args.max_angle_steps,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
         trajectory_ok = serialized_result.get("variants", {}).get("angle_lora", {}).get("trajectory_ok")
     else:
@@ -234,6 +237,8 @@ def run_single_pair(
             max_planning_attempts=args.max_planning_attempts,
             coarse_angle=args.coarse_angle,
             max_angle_steps=args.max_angle_steps,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
         serialized_result = ppe.write_pipeline_artifacts(output_dir, result)
         trajectory_ok = (
@@ -335,6 +340,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen_angles_lora_path", default=str(ppe.DEFAULT_QWEN_ANGLES_LORA_PATH))
     parser.add_argument("--planner_vlm", default=str(ppe.DEFAULT_PLANNER_VLM))
     parser.add_argument("--dinov2_model", default=str(ppe.DEFAULT_DINOV2_MODEL))
+    parser.add_argument("--use_orient_anything", action="store_true")
+    parser.add_argument("--orient_anything_repo", default=str(ppe.DEFAULT_ORIENT_ANYTHING_REPO))
+    parser.add_argument("--orient_anything_ckpt", default=None)
+    parser.add_argument(
+        "--orient_anything_model_size",
+        choices=("small", "base", "large"),
+        default=ppe.DEFAULT_ORIENT_ANYTHING_MODEL_SIZE,
+    )
+    parser.add_argument("--orient_anything_confidence_threshold", type=float, default=0.50)
+    parser.add_argument("--orient_anything_cache_dir", default=None)
     parser.add_argument("--unimatch_ckpt", default=str(ppe.DEFAULT_UNIMATCH_CKPT))
     parser.add_argument("--skip_path_check", action="store_true")
 
@@ -520,6 +535,27 @@ def main() -> None:
     identity_scorer = ppe.DINOv2IdentityScorer(args.dinov2_model, args.device)
     log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
 
+    orient_anything: Optional[ppe.OrientAnythingClient] = None
+    if args.use_orient_anything:
+        log("[load] Orient Anything geometry estimator...")
+        t0 = time.time()
+        orient_anything = ppe.OrientAnythingClient(
+            repo_dir=Path(args.orient_anything_repo),
+            checkpoint_path=(
+                Path(args.orient_anything_ckpt)
+                if args.orient_anything_ckpt is not None
+                else None
+            ),
+            model_size=args.orient_anything_model_size,
+            device=args.device,
+            cache_dir=(
+                Path(args.orient_anything_cache_dir)
+                if args.orient_anything_cache_dir is not None
+                else None
+            ),
+        )
+        log(f"[load] Orient Anything ready ({time.time() - t0:.1f}s)")
+
     ok_count = 0
     skip_count = len(skipped_existing)
     fail_count = 0
@@ -559,6 +595,7 @@ def main() -> None:
                 editor=editor,
                 flow_estimator=flow_estimator,
                 identity_scorer=identity_scorer,
+                orient_anything=orient_anything,
                 args=args,
             )
             ok_count += 1

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib
+import importlib.util
 import json
 import math
 import re
@@ -61,6 +63,8 @@ from model_paths import (  # noqa: E402
 
 MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
 ANGLE_LORA_WEIGHT = QWEN_ANGLES_LORA_WEIGHT
+DEFAULT_ORIENT_ANYTHING_REPO = REPO_ROOT / "third_party" / "Orient-Anything"
+DEFAULT_ORIENT_ANYTHING_MODEL_SIZE = "large"
 
 AZIMUTH_BINS = [
     "front view",
@@ -558,6 +562,9 @@ Required policy:
   distance: close-up | medium shot | wide shot
 - Skip pose stage if no pose/deformation is needed.
 - Skip angle/size stage if source/current already matches endpoint camera and distance.
+- If object_heading_gap is none or small, reject large azimuth/orbit changes; preserve
+  the source-facing direction and adjust only elevation/distance/framing.
+- If camera_orbit_gap is none or small, reject angle steps that orbit to another side view.
 - Every step must preserve source identity/category/texture/material.
 - Step sizes should be moderate-small, like object pose/view change over about 8-10 video frames.
 - Steps should make visible progress while keeping major parts trackable between consecutive frames.
@@ -594,6 +601,19 @@ The ENDPOINT geometry match is the final priority. The later progressive steps s
 split this gap into coarse, trackable keyframe changes, roughly like a stride-8 video
 sampling gap. Prefer fewer meaningful keyframes over many tiny micro-steps.
 
+CRITICAL geometry distinction:
+- object_heading_gap: whether the object's own forward/body axis points in the
+  same image/world direction in SOURCE and ENDPOINT (e.g. both airplanes' noses
+  point the same way). Do NOT confuse this with which side surface is visible.
+- camera_orbit_gap: whether the camera/viewpoint must orbit around the object to
+  match ENDPOINT geometry.
+- framing_gap: crop/scale/distance changes.
+
+If object_heading_gap is none or small, avoid planning large azimuth/orbit changes.
+
+External orientation estimator hints:
+{orient_hints}
+
 Camera prompt vocabulary:
 - azimuth: front view | front-right quarter view | right side view | back-right quarter view | back view | back-left quarter view | left side view | front-left quarter view
 - elevation: low-angle shot | eye-level shot | elevated shot | high-angle shot
@@ -623,6 +643,9 @@ Return this exact JSON:
     ],
     "transform_gaps": {{
       "viewpoint": {{"azimuth": "...", "elevation": "...", "inplane_rotation": "..."}},
+      "object_heading_gap": "none | small | medium | large",
+      "camera_orbit_gap": "none | small | medium | large",
+      "framing_gap": "none | small | medium | large",
       "scale": "...",
       "articulation": [
         {{"part": "...", "source_state": "...", "target_state": "...", "delta": "..."}}
@@ -635,6 +658,9 @@ Return this exact JSON:
   "stage_plan": {{
     "object_motion_type": "rigid | articulated | deformable",
     "pose_gap": "none | small | medium | large",
+    "object_heading_gap": "none | small | medium | large",
+    "camera_orbit_gap": "none | small | medium | large",
+    "framing_gap": "none | small | medium | large",
     "independent_moving_part_groups": ["head/neck", "torso", "front legs"],
     "pose_steps": 0,
     "run_pose_stage": false,
@@ -857,6 +883,9 @@ class CameraPose:
 class StagePlan:
     object_motion_type: str
     pose_gap: str
+    object_heading_gap: str
+    camera_orbit_gap: str
+    framing_gap: str
     independent_moving_part_groups: list[str]
     pose_steps: int
     run_pose_stage: bool
@@ -864,6 +893,14 @@ class StagePlan:
     target_camera: CameraPose
     run_angle_stage: bool
     reason: str = ""
+
+
+@dataclass
+class OrientAnythingPrediction:
+    azimuth: float
+    polar: float
+    rotation: float
+    confidence: float
 
 
 @dataclass
@@ -882,6 +919,9 @@ class Analysis:
     translation: str
     dominant_axes: list[str]
     no_change_axes: list[str]
+    object_heading_gap: str = "unknown"
+    camera_orbit_gap: str = "unknown"
+    framing_gap: str = "unknown"
 
 
 @dataclass
@@ -1130,6 +1170,9 @@ def build_analysis(parsed: dict[str, Any]) -> Analysis:
         translation=gaps.get("translation", ""),
         dominant_axes=gaps.get("dominant_axes", []),
         no_change_axes=gaps.get("no_change_axes", []),
+        object_heading_gap=str(gaps.get("object_heading_gap", "unknown")).lower(),
+        camera_orbit_gap=str(gaps.get("camera_orbit_gap", "unknown")).lower(),
+        framing_gap=str(gaps.get("framing_gap", "unknown")).lower(),
     )
 
 
@@ -1171,6 +1214,9 @@ def build_stage_plan(parsed: dict[str, Any], max_pose_steps: int) -> StagePlan:
     raw = parsed.get("stage_plan", {})
     object_motion_type = str(raw.get("object_motion_type", "rigid")).lower()
     pose_gap = str(raw.get("pose_gap", "none")).lower()
+    object_heading_gap = str(raw.get("object_heading_gap", "unknown")).lower()
+    camera_orbit_gap = str(raw.get("camera_orbit_gap", "unknown")).lower()
+    framing_gap = str(raw.get("framing_gap", "unknown")).lower()
     groups = [str(item) for item in raw.get("independent_moving_part_groups", []) if item]
     requested_pose_steps = _coerce_non_negative_int(raw.get("pose_steps", 0))
 
@@ -1191,6 +1237,9 @@ def build_stage_plan(parsed: dict[str, Any], max_pose_steps: int) -> StagePlan:
     return StagePlan(
         object_motion_type=object_motion_type,
         pose_gap=pose_gap,
+        object_heading_gap=object_heading_gap,
+        camera_orbit_gap=camera_orbit_gap,
+        framing_gap=framing_gap,
         independent_moving_part_groups=groups,
         pose_steps=pose_steps,
         run_pose_stage=pose_steps > 0,
@@ -1249,6 +1298,68 @@ def _subsample_path(path: list[str], max_transitions: int) -> list[str]:
     return deduped
 
 
+def _gap_is_at_most_small(value: str) -> bool:
+    return value.lower() in {"none", "small"}
+
+
+def format_orient_hints_for_diagnosis(orient_hints: Optional[dict[str, Any]]) -> str:
+    if not orient_hints or not orient_hints.get("enabled"):
+        return "not available; rely on visible image evidence only."
+    if orient_hints.get("error"):
+        return f"not available due to error: {orient_hints['error']}"
+
+    source = orient_hints.get("source", {})
+    target = orient_hints.get("target", {})
+    delta = orient_hints.get("delta", {})
+    source_conf = source.get("confidence")
+    target_conf = target.get("confidence")
+    return "\n".join(
+        [
+            "Orient Anything predicted single-object orientation angles.",
+            f"- confidence_ok: {orient_hints.get('confidence_ok', False)} "
+            f"(threshold={orient_hints.get('confidence_threshold', 'unknown')})",
+            f"- source: azimuth={_format_degrees(source.get('azimuth'))}, "
+            f"polar={_format_degrees(source.get('polar'))}, "
+            f"rotation={_format_degrees(source.get('rotation'))}, "
+            f"confidence={source_conf:.3f}" if isinstance(source_conf, (int, float)) else "- source: unknown",
+            f"- target: azimuth={_format_degrees(target.get('azimuth'))}, "
+            f"polar={_format_degrees(target.get('polar'))}, "
+            f"rotation={_format_degrees(target.get('rotation'))}, "
+            f"confidence={target_conf:.3f}" if isinstance(target_conf, (int, float)) else "- target: unknown",
+            f"- azimuth_delta={_format_degrees(delta.get('azimuth_degrees'))}; "
+            f"object_heading_hint={orient_hints.get('object_heading_hint', 'unknown')}",
+            "Use this as numeric evidence for object_heading_gap, but do not override clear visual evidence.",
+        ]
+    )
+
+
+def apply_orient_hint_overrides(parsed: dict[str, Any], orient_hints: Optional[dict[str, Any]]) -> list[str]:
+    if not orient_hints or not orient_hints.get("enabled") or not orient_hints.get("confidence_ok"):
+        return []
+
+    heading_hint = str(orient_hints.get("object_heading_hint", "unknown")).lower()
+    if heading_hint not in {"none", "small"}:
+        return []
+
+    overrides: list[str] = []
+    analysis = parsed.setdefault("analysis", {})
+    gaps = analysis.setdefault("transform_gaps", {})
+    stage_plan = parsed.setdefault("stage_plan", {})
+
+    previous_analysis_gap = str(gaps.get("object_heading_gap", "unknown")).lower()
+    previous_stage_gap = str(stage_plan.get("object_heading_gap", "unknown")).lower()
+    if previous_analysis_gap not in {"none", "small"}:
+        gaps["object_heading_gap"] = "small"
+        overrides.append(
+            f"analysis.transform_gaps.object_heading_gap: {previous_analysis_gap} -> small"
+        )
+    if previous_stage_gap not in {"none", "small"}:
+        stage_plan["object_heading_gap"] = "small"
+        overrides.append(f"stage_plan.object_heading_gap: {previous_stage_gap} -> small")
+
+    return overrides
+
+
 def generate_angle_steps(
     stage_plan: StagePlan,
     start_step: int,
@@ -1261,12 +1372,27 @@ def generate_angle_steps(
     if coarse_angle:
         source_az = _coarse_azimuth(stage_plan.source_camera.azimuth)
         target_az = _coarse_azimuth(stage_plan.target_camera.azimuth)
+        if _gap_is_at_most_small(stage_plan.object_heading_gap):
+            log(
+                "[angle] object_heading_gap is "
+                f"{stage_plan.object_heading_gap}; preserving source azimuth "
+                f"({source_az}) and only adjusting elevation/distance."
+            )
+            target_az = source_az
         az_path = _circular_path(source_az, target_az, CARDINAL_AZIMUTH_BINS)
         az_path = _subsample_path(az_path, max_angle_steps)
         el_path = [stage_plan.source_camera.elevation, stage_plan.target_camera.elevation]
         dist_path = [stage_plan.source_camera.distance, stage_plan.target_camera.distance]
     else:
-        az_path = _circular_path(stage_plan.source_camera.azimuth, stage_plan.target_camera.azimuth, AZIMUTH_BINS)
+        target_azimuth = stage_plan.target_camera.azimuth
+        if _gap_is_at_most_small(stage_plan.object_heading_gap):
+            log(
+                "[angle] object_heading_gap is "
+                f"{stage_plan.object_heading_gap}; preserving source azimuth "
+                f"({stage_plan.source_camera.azimuth}) and only adjusting elevation/distance."
+            )
+            target_azimuth = stage_plan.source_camera.azimuth
+        az_path = _circular_path(stage_plan.source_camera.azimuth, target_azimuth, AZIMUTH_BINS)
         el_path = _linear_path(stage_plan.source_camera.elevation, stage_plan.target_camera.elevation, ELEVATION_BINS)
         dist_path = _linear_path(stage_plan.source_camera.distance, stage_plan.target_camera.distance, DISTANCE_BINS)
         az_path = _subsample_path(az_path, max_angle_steps)
@@ -1458,6 +1584,200 @@ def _check_runtime_dependencies() -> None:
     import torchvision
 
     log(f"[deps] torch {torch.__version__}, torchvision {torchvision.__version__}")
+
+
+def _circular_degree_distance(first: float, second: float, period: float = 360.0) -> float:
+    delta = abs((first - second) % period)
+    return float(min(delta, period - delta))
+
+
+def _orientation_gap_from_delta(delta_degrees: Optional[float]) -> str:
+    if delta_degrees is None:
+        return "unknown"
+    if delta_degrees <= 10.0:
+        return "none"
+    if delta_degrees <= 25.0:
+        return "small"
+    if delta_degrees <= 60.0:
+        return "medium"
+    return "large"
+
+
+def _format_degrees(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value:.1f}°"
+
+
+class OrientAnythingClient:
+    """Lazy wrapper for the vendored Orient Anything orientation estimator."""
+
+    MODEL_CONFIGS = {
+        "small": {
+            "dino_mode": "small",
+            "in_dim": 384,
+            "checkpoint": "cropsmallEx03/dino_weight.pt",
+            "dino_path_attr": "DINO_SMALL",
+        },
+        "base": {
+            "dino_mode": "base",
+            "in_dim": 768,
+            "checkpoint": "cropbaseEx032/dino_weight.pt",
+            "dino_path_attr": "DINO_BASE",
+        },
+        "large": {
+            "dino_mode": "large",
+            "in_dim": 1024,
+            "checkpoint": "croplargeEX2/dino_weight.pt",
+            "dino_path_attr": "DINO_LARGE",
+        },
+    }
+
+    def __init__(
+        self,
+        repo_dir: Path,
+        checkpoint_path: Optional[Path],
+        model_size: str,
+        device: str,
+        cache_dir: Optional[Path] = None,
+    ) -> None:
+        if model_size not in self.MODEL_CONFIGS:
+            raise ValueError(f"Unsupported Orient Anything model_size: {model_size}")
+        self.repo_dir = repo_dir.expanduser().resolve()
+        if not self.repo_dir.is_dir():
+            raise FileNotFoundError(
+                f"Orient Anything repo not found: {self.repo_dir}\n"
+                "Clone it with:\n"
+                "  git clone https://github.com/SpatialVision/Orient-Anything "
+                "third_party/Orient-Anything"
+            )
+
+        self.model_size = model_size
+        self.device = device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+        self.cache_dir = cache_dir.expanduser().resolve() if cache_dir is not None else None
+        config = self.MODEL_CONFIGS[model_size]
+
+        paths_mod = self._load_oa_module("paths", self.repo_dir / "paths.py")
+        vision_tower = self._load_oa_module(
+            "orient_anything_vision_tower",
+            self.repo_dir / "vision_tower.py",
+        )
+
+        resolved_ckpt = self._resolve_checkpoint(checkpoint_path, config["checkpoint"])
+        self.checkpoint_path = Path(resolved_ckpt)
+        log(
+            "[orient-anything] Loading "
+            f"{model_size} model from {self.checkpoint_path} on {self.device}"
+        )
+
+        self.model = vision_tower.DINOv2_MLP(
+            dino_mode=config["dino_mode"],
+            in_dim=config["in_dim"],
+            out_dim=360 + 180 + 180 + 2,
+            evaluate=True,
+            mask_dino=False,
+            frozen_back=False,
+        )
+        self.model.eval()
+        state_dict = torch.load(self.checkpoint_path, map_location="cpu")
+        self.model.load_state_dict(state_dict)
+        self.model = self.model.to(self.device)
+
+        from transformers import AutoImageProcessor
+
+        dino_model_id = getattr(paths_mod, config["dino_path_attr"])
+        processor_kwargs = {}
+        if self.cache_dir is not None:
+            processor_kwargs["cache_dir"] = str(self.cache_dir)
+        self.preprocess = AutoImageProcessor.from_pretrained(dino_model_id, **processor_kwargs)
+
+    @staticmethod
+    def _load_oa_module(module_name: str, module_path: Path) -> Any:
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load Orient Anything module: {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _resolve_checkpoint(
+        self,
+        checkpoint_path: Optional[Path],
+        default_filename: str,
+    ) -> Path:
+        if checkpoint_path is not None:
+            resolved = checkpoint_path.expanduser().resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(f"Orient Anything checkpoint not found: {resolved}")
+            return resolved
+
+        from huggingface_hub import hf_hub_download
+
+        return Path(
+            hf_hub_download(
+                repo_id="Viglong/Orient-Anything",
+                filename=default_filename,
+                repo_type="model",
+                cache_dir=str(self.cache_dir) if self.cache_dir is not None else None,
+                resume_download=True,
+            )
+        )
+
+    @torch.no_grad()
+    def predict(self, image: Image.Image) -> OrientAnythingPrediction:
+        image_inputs = self.preprocess(images=image.convert("RGB"))
+        pixel_values = torch.from_numpy(np.array(image_inputs["pixel_values"])).to(self.device)
+        image_inputs["pixel_values"] = pixel_values
+        dino_pred = self.model(image_inputs)
+
+        azimuth = torch.argmax(dino_pred[:, 0:360], dim=-1)
+        polar = torch.argmax(dino_pred[:, 360 : 360 + 180], dim=-1)
+        rotation = torch.argmax(dino_pred[:, 360 + 180 : 360 + 180 + 360], dim=-1)
+        confidence = F.softmax(dino_pred[:, -2:], dim=-1)[0][0]
+        return OrientAnythingPrediction(
+            azimuth=float(azimuth.item()),
+            polar=float(polar.item() - 90),
+            rotation=float(rotation.item() - 180),
+            confidence=float(confidence.item()),
+        )
+
+    def estimate_pair(
+        self,
+        source_img: Image.Image,
+        target_img: Image.Image,
+        confidence_threshold: float,
+    ) -> dict[str, Any]:
+        source = self.predict(source_img)
+        target = self.predict(target_img)
+        confidence_ok = (
+            source.confidence >= confidence_threshold
+            and target.confidence >= confidence_threshold
+        )
+        azimuth_delta = _circular_degree_distance(source.azimuth, target.azimuth)
+        polar_delta = abs(source.polar - target.polar)
+        rotation_delta = _circular_degree_distance(source.rotation, target.rotation)
+        return {
+            "enabled": True,
+            "model_size": self.model_size,
+            "checkpoint_path": str(self.checkpoint_path),
+            "confidence_threshold": confidence_threshold,
+            "source": asdict(source),
+            "target": asdict(target),
+            "delta": {
+                "azimuth_degrees": azimuth_delta,
+                "polar_degrees": polar_delta,
+                "rotation_degrees": rotation_delta,
+            },
+            "confidence_ok": confidence_ok,
+            "object_heading_hint": (
+                _orientation_gap_from_delta(azimuth_delta) if confidence_ok else "unknown"
+            ),
+            "note": (
+                "Orient Anything expects a single dominant object crop; treat hints as "
+                "advisory when images contain clutter, occlusion, or symmetric objects."
+            ),
+        }
 
 
 class MotionNFTEditor:
@@ -2585,9 +2905,11 @@ def diagnose_stage_plan(
     planner_vlm: QwenVLMClient,
     output_dir: Path,
     max_pose_steps: int,
+    orient_hints: Optional[dict[str, Any]] = None,
     revision_hint: str = "",
 ) -> tuple[Analysis, StagePlan, dict[str, Any]]:
     log("\n========== Phase 0A: Pair Diagnosis ==========")
+    orient_hint_text = format_orient_hints_for_diagnosis(orient_hints)
     messages = [
         {"role": "system", "content": [{"type": "text", "text": DIAGNOSIS_SYSTEM}]},
         {
@@ -2599,7 +2921,10 @@ def diagnose_stage_plan(
                 {"type": "text", "text": "(IMAGE 2 = ENDPOINT)"},
                 {
                     "type": "text",
-                    "text": DIAGNOSIS_USER.format(max_pose_steps=max_pose_steps)
+                    "text": DIAGNOSIS_USER.format(
+                        max_pose_steps=max_pose_steps,
+                        orient_hints=orient_hint_text,
+                    )
                     + (
                         "\n\nPrevious planning verification failed. Revise diagnosis/stage plan.\n"
                         f"Revision hint: {revision_hint}"
@@ -2611,6 +2936,12 @@ def diagnose_stage_plan(
         },
     ]
     parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=2048))
+    if orient_hints is not None:
+        parsed.setdefault("external_geometry_hints", {})["orient_anything"] = orient_hints
+        overrides = apply_orient_hint_overrides(parsed, orient_hints)
+        if overrides:
+            orient_hints["applied_overrides"] = overrides
+            log("[diagnosis] Orient Anything overrides: " + "; ".join(overrides))
     analysis = build_analysis(parsed)
     stage_plan = build_stage_plan(parsed, max_pose_steps=max_pose_steps)
     diagnosis_path = output_dir / "stage_diagnosis.json"
@@ -2646,12 +2977,23 @@ def _is_valid_angle_prompt(instruction: str) -> bool:
     return False
 
 
+def _angle_prompt_azimuth(instruction: str) -> Optional[str]:
+    if not instruction.startswith("<sks> "):
+        return None
+    rest = instruction[len("<sks> ") :]
+    for azimuth in AZIMUTH_BINS:
+        if rest.startswith(f"{azimuth} "):
+            return azimuth
+    return None
+
+
 def validate_plan_structure(
     stage_plan: StagePlan,
     all_steps: list[SubInstruction],
-) -> dict[str, bool]:
+) -> dict[str, Any]:
     pose_steps = [step for step in all_steps if step.transform_type != "angle_size"]
     angle_steps = [step for step in all_steps if step.transform_type == "angle_size"]
+    semantic_issues: list[str] = []
 
     if stage_plan.pose_steps <= 0:
         ordering_ok = len(pose_steps) == 0
@@ -2681,16 +3023,43 @@ def validate_plan_structure(
             prompt_format_ok = False
             break
 
+    source_az = _coarse_azimuth(stage_plan.source_camera.azimuth)
+    azimuths = [
+        _coarse_azimuth(azimuth)
+        for step in angle_steps
+        if (azimuth := _angle_prompt_azimuth(step.instruction)) is not None
+    ]
+    changes_azimuth = any(azimuth != source_az for azimuth in azimuths)
+
+    if _gap_is_at_most_small(stage_plan.object_heading_gap) and changes_azimuth:
+        semantic_issues.append(
+            "object_heading_gap is none/small but angle steps change azimuth; "
+            "preserve source-facing direction and adjust only elevation/distance/framing."
+        )
+    if _gap_is_at_most_small(stage_plan.camera_orbit_gap) and changes_azimuth:
+        semantic_issues.append(
+            "camera_orbit_gap is none/small but angle steps introduce a camera orbit."
+        )
+    semantic_constraints_ok = not semantic_issues
+
     return {
         "ordering_ok": ordering_ok,
         "step_count_ok": step_count_ok,
         "prompt_format_ok": prompt_format_ok,
+        "semantic_constraints_ok": semantic_constraints_ok,
+        "semantic_failure_reason": "; ".join(semantic_issues),
+        "semantic_revision_hint": (
+            "Revise diagnosis/plan: separate object heading from camera orbit and avoid "
+            "azimuth changes when heading/orbit gap is small."
+            if semantic_issues
+            else ""
+        ),
     }
 
 
 def merge_planning_verify(
     vlm_verify: dict[str, Any],
-    structural_checks: dict[str, bool],
+    structural_checks: dict[str, Any],
 ) -> dict[str, Any]:
     merged = dict(vlm_verify)
     for key, value in structural_checks.items():
@@ -2701,10 +3070,22 @@ def merge_planning_verify(
             "ordering_ok",
             "step_count_ok",
             "prompt_format_ok",
+            "semantic_constraints_ok",
             "identity_constraints_ok",
             "shared_parts_ok",
         )
     )
+    semantic_reason = structural_checks.get("semantic_failure_reason")
+    if semantic_reason:
+        existing_reason = str(merged.get("failure_reason", "") or "")
+        merged["failure_reason"] = (
+            f"{existing_reason}; {semantic_reason}" if existing_reason else semantic_reason
+        )
+        existing_hint = str(merged.get("revision_hint", "") or "")
+        semantic_hint = str(structural_checks.get("semantic_revision_hint", "") or "")
+        merged["revision_hint"] = (
+            f"{existing_hint}; {semantic_hint}" if existing_hint and semantic_hint else semantic_hint
+        )
     return merged
 
 
@@ -2804,10 +3185,38 @@ def plan_staged_until_verified(
     max_planning_attempts: int,
     coarse_angle: bool,
     max_angle_steps: int,
+    orient_anything: Optional[OrientAnythingClient] = None,
+    orient_confidence_threshold: float = 0.5,
 ) -> tuple[Analysis, StagePlan, list[SubInstruction], dict[str, Any], dict[str, Any]]:
     attempt = 0
     revision_hint = ""
     last_verify: dict[str, Any] = {}
+    orient_hints: Optional[dict[str, Any]] = None
+    if orient_anything is not None:
+        log("\n========== Phase 0G: Orient Anything Geometry Hints ==========")
+        try:
+            orient_hints = orient_anything.estimate_pair(
+                source_img=source_img,
+                target_img=target_img,
+                confidence_threshold=orient_confidence_threshold,
+            )
+        except Exception as exc:
+            orient_hints = {"enabled": True, "error": str(exc)}
+            log(f"[orient-anything] Failed to estimate orientation hints: {exc}")
+        orient_path = output_dir / "orient_anything_geometry.json"
+        orient_path.write_text(json.dumps(orient_hints, indent=2, ensure_ascii=False), encoding="utf-8")
+        if orient_hints.get("error"):
+            log(f"[orient-anything] Wrote error report {orient_path}")
+        else:
+            delta = orient_hints.get("delta", {})
+            log(
+                "[orient-anything] "
+                f"source_conf={orient_hints.get('source', {}).get('confidence', 0.0):.3f}, "
+                f"target_conf={orient_hints.get('target', {}).get('confidence', 0.0):.3f}, "
+                f"azimuth_delta={delta.get('azimuth_degrees', 0.0):.1f}°, "
+                f"heading_hint={orient_hints.get('object_heading_hint', 'unknown')}"
+            )
+            log(f"[orient-anything] Wrote {orient_path}")
     while True:
         attempt += 1
         log(f"\n[plan] Verified staged planning attempt {attempt}")
@@ -2817,6 +3226,7 @@ def plan_staged_until_verified(
             planner_vlm=planner_vlm,
             output_dir=output_dir,
             max_pose_steps=max_pose_steps,
+            orient_hints=orient_hints,
             revision_hint=revision_hint,
         )
         pose_steps, pose_raw = plan_pose_stage(
@@ -3997,6 +4407,8 @@ def progressive_pose_edit(
     coarse_angle: bool = True,
     max_angle_steps: int = 2,
     angle_step_adapter: str = "angle",
+    orient_anything: Optional[OrientAnythingClient] = None,
+    orient_confidence_threshold: float = 0.5,
 ) -> PipelineResult:
     log("\n========== Phase 0: Staged Planning (target=target) ==========")
     analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
@@ -4008,6 +4420,8 @@ def progressive_pose_edit(
         max_planning_attempts=max_planning_attempts,
         coarse_angle=coarse_angle,
         max_angle_steps=max_angle_steps,
+        orient_anything=orient_anything,
+        orient_confidence_threshold=orient_confidence_threshold,
     )
     raw_plan["planning_target"] = "target"
     (output_dir / "plan.json").write_text(
@@ -4118,6 +4532,41 @@ def parse_args() -> argparse.Namespace:
         "--dinov2_model",
         default=str(DEFAULT_DINOV2_MODEL),
         help="DINOv2 path (default: .../motionedit_vlm/dinov2-base).",
+    )
+    parser.add_argument(
+        "--use_orient_anything",
+        action="store_true",
+        help="Use vendored Orient Anything predictions as geometry hints during staged planning.",
+    )
+    parser.add_argument(
+        "--orient_anything_repo",
+        default=str(DEFAULT_ORIENT_ANYTHING_REPO),
+        help="Path to the cloned SpatialVision/Orient-Anything repository.",
+    )
+    parser.add_argument(
+        "--orient_anything_ckpt",
+        default=None,
+        help=(
+            "Optional local Orient Anything checkpoint path. If omitted with "
+            "--use_orient_anything, the matching Hugging Face checkpoint is downloaded."
+        ),
+    )
+    parser.add_argument(
+        "--orient_anything_model_size",
+        choices=("small", "base", "large"),
+        default=DEFAULT_ORIENT_ANYTHING_MODEL_SIZE,
+        help="Orient Anything checkpoint scale; large is recommended for best accuracy.",
+    )
+    parser.add_argument(
+        "--orient_anything_confidence_threshold",
+        type=float,
+        default=0.50,
+        help="Minimum source/target Orient Anything confidence required for hard heading overrides.",
+    )
+    parser.add_argument(
+        "--orient_anything_cache_dir",
+        default=None,
+        help="Optional Hugging Face cache dir for Orient Anything/DINOv2 downloads.",
     )
     parser.add_argument(
         "--unimatch_ckpt",
@@ -4378,6 +4827,8 @@ def progressive_pose_edit_angle_lora_comparison(
     max_planning_attempts: int = 0,
     coarse_angle: bool = True,
     max_angle_steps: int = 2,
+    orient_anything: Optional[OrientAnythingClient] = None,
+    orient_confidence_threshold: float = 0.5,
 ) -> dict[str, Any]:
     log("\n========== Phase 0: Shared Staged Planning (target=target) ==========")
     analysis, stage_plan, steps, raw_plan, planning_verify = plan_staged_until_verified(
@@ -4389,6 +4840,8 @@ def progressive_pose_edit_angle_lora_comparison(
         max_planning_attempts=max_planning_attempts,
         coarse_angle=coarse_angle,
         max_angle_steps=max_angle_steps,
+        orient_anything=orient_anything,
+        orient_confidence_threshold=orient_confidence_threshold,
     )
     raw_plan["planning_target"] = "target"
     raw_plan["comparison_mode"] = "angle_lora_vs_base_qwen_angle"
@@ -4510,6 +4963,10 @@ def main() -> None:
     log(f"  planner_vlm           = {args.planner_vlm}")
     log(f"  dinov2_model          = {args.dinov2_model}")
     log(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
+    if args.use_orient_anything:
+        log(f"  orient_anything_repo  = {args.orient_anything_repo}")
+        log(f"  orient_anything_ckpt  = {args.orient_anything_ckpt or '(auto-download)'}")
+        log(f"  orient_anything_size  = {args.orient_anything_model_size}")
 
     source_img = Image.open(args.source_image).convert("RGB")
     target_img = Image.open(args.target_image).convert("RGB")
@@ -4580,6 +5037,27 @@ def main() -> None:
     identity_scorer = DINOv2IdentityScorer(args.dinov2_model, args.device)
     log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
 
+    orient_anything: Optional[OrientAnythingClient] = None
+    if args.use_orient_anything:
+        log("[load] Orient Anything geometry estimator...")
+        t0 = time.time()
+        orient_anything = OrientAnythingClient(
+            repo_dir=Path(args.orient_anything_repo),
+            checkpoint_path=(
+                Path(args.orient_anything_ckpt)
+                if args.orient_anything_ckpt is not None
+                else None
+            ),
+            model_size=args.orient_anything_model_size,
+            device=args.device,
+            cache_dir=(
+                Path(args.orient_anything_cache_dir)
+                if args.orient_anything_cache_dir is not None
+                else None
+            ),
+        )
+        log(f"[load] Orient Anything ready ({time.time() - t0:.1f}s)")
+
     pipeline_t0 = time.time()
     if args.compare_angle_lora:
         log("\n[pipeline] Running angle LoRA comparison mode")
@@ -4604,6 +5082,8 @@ def main() -> None:
             max_planning_attempts=args.max_planning_attempts,
             coarse_angle=args.coarse_angle,
             max_angle_steps=args.max_angle_steps,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
     else:
         result = progressive_pose_edit(
@@ -4627,6 +5107,8 @@ def main() -> None:
             max_planning_attempts=args.max_planning_attempts,
             coarse_angle=args.coarse_angle,
             max_angle_steps=args.max_angle_steps,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
         log("\n[output] Writing final artifacts")
         write_pipeline_artifacts(output_dir, result)

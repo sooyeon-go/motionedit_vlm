@@ -1,4 +1,7 @@
 *.safetensors
+*.pt
+models--*/
+.cache/
 *_local.py
 data
 *.pyc

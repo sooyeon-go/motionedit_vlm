@@ -38,6 +38,12 @@ MAX_POSE_STEPS="${MAX_POSE_STEPS:-4}"
 COARSE_ANGLE="${COARSE_ANGLE:-1}"
 MAX_ANGLE_STEPS="${MAX_ANGLE_STEPS:-2}"
 COMPARE_ANGLE_LORA="${COMPARE_ANGLE_LORA:-0}"
+USE_ORIENT_ANYTHING="${USE_ORIENT_ANYTHING:-0}"
+ORIENT_ANYTHING_REPO="${ORIENT_ANYTHING_REPO:-third_party/Orient-Anything}"
+ORIENT_ANYTHING_CKPT="${ORIENT_ANYTHING_CKPT:-}"
+ORIENT_ANYTHING_MODEL_SIZE="${ORIENT_ANYTHING_MODEL_SIZE:-large}"
+ORIENT_ANYTHING_CONFIDENCE_THRESHOLD="${ORIENT_ANYTHING_CONFIDENCE_THRESHOLD:-0.50}"
+ORIENT_ANYTHING_CACHE_DIR="${ORIENT_ANYTHING_CACHE_DIR:-}"
 LIMIT="${LIMIT:-}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 INTERLEAVE_CLASSES="${INTERLEAVE_CLASSES:-1}"
@@ -81,6 +87,13 @@ echo "[run_spair71k] max_pose_steps           = ${MAX_POSE_STEPS}"
 echo "[run_spair71k] coarse_angle             = ${COARSE_ANGLE} (1=front/right/back/left coarse bins, 0=8-bin fine angle)"
 echo "[run_spair71k] max_angle_steps          = ${MAX_ANGLE_STEPS}"
 echo "[run_spair71k] compare_angle_lora       = ${COMPARE_ANGLE_LORA} (1=angle LoRA vs base Qwen angle-step ablation)"
+echo "[run_spair71k] use_orient_anything      = ${USE_ORIENT_ANYTHING} (1=inject Orient Anything planning hints)"
+if [[ "${USE_ORIENT_ANYTHING}" == "1" ]]; then
+  echo "[run_spair71k] orient_anything_repo    = ${ORIENT_ANYTHING_REPO}"
+  echo "[run_spair71k] orient_anything_ckpt    = ${ORIENT_ANYTHING_CKPT:-auto-download}"
+  echo "[run_spair71k] orient_anything_size    = ${ORIENT_ANYTHING_MODEL_SIZE}"
+  echo "[run_spair71k] orient_anything_conf    = ${ORIENT_ANYTHING_CONFIDENCE_THRESHOLD}"
+fi
 echo "[run_spair71k] log_to_file              = ${LOG_TO_FILE} (0=terminal only, 1=terminal+logs)"
 if [[ -n "${LIMIT}" ]]; then
   echo "[run_spair71k] limit/worker = ${LIMIT}"
@@ -146,6 +159,20 @@ for WORKER_ID in "${!GPU_ARR[@]}"; do
   fi
   if [[ "${COMPARE_ANGLE_LORA}" == "1" ]]; then
     CMD+=(--compare_angle_lora)
+  fi
+  if [[ "${USE_ORIENT_ANYTHING}" == "1" ]]; then
+    CMD+=(
+      --use_orient_anything
+      --orient_anything_repo "${ORIENT_ANYTHING_REPO}"
+      --orient_anything_model_size "${ORIENT_ANYTHING_MODEL_SIZE}"
+      --orient_anything_confidence_threshold "${ORIENT_ANYTHING_CONFIDENCE_THRESHOLD}"
+    )
+    if [[ -n "${ORIENT_ANYTHING_CKPT}" ]]; then
+      CMD+=(--orient_anything_ckpt "${ORIENT_ANYTHING_CKPT}")
+    fi
+    if [[ -n "${ORIENT_ANYTHING_CACHE_DIR}" ]]; then
+      CMD+=(--orient_anything_cache_dir "${ORIENT_ANYTHING_CACHE_DIR}")
+    fi
   fi
   if [[ -n "${EXTRA_ARGS}" ]]; then
     # shellcheck disable=SC2206
