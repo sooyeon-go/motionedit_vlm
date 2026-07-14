@@ -537,6 +537,33 @@ Rules:
 - best_candidate_id must be an integer in [0, {max_candidate_id}].
 - Prefer the candidate that would need the smallest later pose edit to reach TARGET."""
 
+PREALIGN_OA_VLM_SELECT_SYSTEM = """You are a coarse orientation matcher using Orient Anything measurements.
+Answer with valid JSON only. Do not invent numbers."""
+
+PREALIGN_OA_VLM_SELECT_USER = """Orient Anything measured object orientation as (azimuth, polar, rotation) in degrees
+plus a confidence in [0, 1]. Confidence may be low; still pick the relatively closest candidate.
+
+TARGET orientation:
+{target_orientation}
+
+Candidate orientations after applying a deterministic flip/rotation to SOURCE:
+{candidate_orientation_table}
+
+Choose which candidate transform makes SOURCE orientation closest to TARGET.
+Prioritize azimuth match first (left/right / facing direction), then polar, then in-plane rotation.
+Ignore texture/identity; this is only coarse D4 orientation matching.
+
+Return this exact JSON:
+{{
+  "best_candidate_id": 0,
+  "reason": "short reason using the given angles"
+}}
+
+Rules:
+- best_candidate_id must be an integer in [0, {max_candidate_id}].
+- Prefer smaller absolute azimuth/polar/rotation gaps to TARGET.
+- Do not invent candidates outside the table."""
+
 PLANNING_VERIFY_SYSTEM = """You are a strict editing-plan auditor.
 Answer with valid JSON only."""
 
@@ -1651,6 +1678,21 @@ class OrientAnythingClient:
                 "  git clone https://github.com/SpatialVision/Orient-Anything "
                 "third_party/Orient-Anything"
             )
+        required_files = ("paths.py", "vision_tower.py", "utils.py")
+        missing = [name for name in required_files if not (self.repo_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"Orient Anything repo at {self.repo_dir} is incomplete "
+                f"(missing: {', '.join(missing)}).\n"
+                "Fix with one of:\n"
+                "  git submodule update --init --recursive third_party/Orient-Anything\n"
+                "  # or\n"
+                "  git -C third_party/Orient-Anything pull\n"
+                "  # or fresh clone\n"
+                "  rm -rf third_party/Orient-Anything && "
+                "git clone https://github.com/SpatialVision/Orient-Anything "
+                "third_party/Orient-Anything"
+            )
 
         self.model_size = model_size
         self.device = device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
@@ -2545,30 +2587,59 @@ def _format_coarse_candidate_table(transforms: list[CoarseOrientationTransform])
     return "\n".join(f"- {transform.label}" for transform in transforms)
 
 
-def _orient_candidate_score(
+def _orient_candidate_deltas(
     candidate: OrientAnythingPrediction,
     target: OrientAnythingPrediction,
 ) -> dict[str, float]:
-    azimuth_delta = _circular_degree_distance(candidate.azimuth, target.azimuth)
-    polar_delta = abs(candidate.polar - target.polar)
-    rotation_delta = _circular_degree_distance(candidate.rotation, target.rotation)
-    # Azimuth is the primary pre-align signal; polar/rotation only break ties.
-    score = azimuth_delta + 0.25 * polar_delta + 0.10 * rotation_delta
+    """Orientation gaps (for logging / VLM table; selection is done by VLM)."""
     return {
-        "score": score,
-        "azimuth_delta": azimuth_delta,
-        "polar_delta": polar_delta,
-        "rotation_delta": rotation_delta,
+        "azimuth_delta": _circular_degree_distance(candidate.azimuth, target.azimuth),
+        "polar_delta": abs(candidate.polar - target.polar),
+        "rotation_delta": _circular_degree_distance(candidate.rotation, target.rotation),
     }
+
+
+def _format_orient_prediction_line(prediction: OrientAnythingPrediction) -> str:
+    return (
+        f"azimuth={prediction.azimuth:.1f}°, polar={prediction.polar:.1f}°, "
+        f"rotation={prediction.rotation:.1f}°, confidence={prediction.confidence:.4f}"
+    )
+
+
+def _format_orient_candidate_orientation_table(
+    candidate_records: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+    for record in candidate_records:
+        pred = record["prediction"]
+        deltas = record["deltas"]
+        flip_h = record["flip_horizontal"]
+        flip_v = record["flip_vertical"]
+        rot = record["rotation_degrees"]
+        lines.append(
+            f"- id={record['candidate_id']}: flip_h={flip_h}, flip_v={flip_v}, "
+            f"rotate={rot}° | "
+            f"azimuth={pred['azimuth']:.1f}°, polar={pred['polar']:.1f}°, "
+            f"rotation={pred['rotation']:.1f}°, conf={pred['confidence']:.4f} | "
+            f"deltas(azimuth/polar/rotation)="
+            f"{deltas['azimuth_delta']:.1f}/{deltas['polar_delta']:.1f}/{deltas['rotation_delta']:.1f}"
+        )
+    return "\n".join(lines)
 
 
 def orient_anything_pre_align_source(
     source_img: Image.Image,
     target_img: Image.Image,
     orient_anything: OrientAnythingClient,
+    planner_vlm: QwenVLMClient,
     output_dir: Path,
     confidence_threshold: float,
 ) -> Optional[tuple[Image.Image, PreAlignDecision, dict[str, Any]]]:
+    """Measure OA angles on 8 candidates + TARGET, then let VLM pick the closest transform.
+
+    Confidence is logged only (not a selection gate). Final acceptance remains with
+    image-based VLM verify in ``pre_align_source_until_verified``.
+    """
     log("\n========== Phase -1A: Orient Anything Pre-Alignment ==========")
     transforms, raw_count = enumerate_unique_coarse_orientation_transforms(source_img)
     if not transforms:
@@ -2576,14 +2647,13 @@ def orient_anything_pre_align_source(
         return None
 
     target_prediction = orient_anything.predict(target_img)
+    candidates_by_id: dict[int, Image.Image] = {}
     candidate_records: list[dict[str, Any]] = []
-    best_record: Optional[dict[str, Any]] = None
-    best_aligned: Optional[Image.Image] = None
 
     for transform in transforms:
         candidate = apply_coarse_orientation_transform(source_img, transform)
         prediction = orient_anything.predict(candidate)
-        deltas = _orient_candidate_score(prediction, target_prediction)
+        deltas = _orient_candidate_deltas(prediction, target_prediction)
         confidence_ok = (
             prediction.confidence >= confidence_threshold
             and target_prediction.confidence >= confidence_threshold
@@ -2598,37 +2668,46 @@ def orient_anything_pre_align_source(
             "confidence_ok": confidence_ok,
         }
         candidate_records.append(record)
-        if not confidence_ok:
-            continue
-        if best_record is None or deltas["score"] < best_record["deltas"]["score"]:
-            best_record = record
-            best_aligned = candidate
-
-    payload: dict[str, Any] = {
-        "mode": "orient_anything_pre_align",
-        "num_raw_candidates": raw_count,
-        "num_candidates": len(transforms),
-        "confidence_threshold": confidence_threshold,
-        "target_prediction": asdict(target_prediction),
-        "candidate_records": candidate_records,
-    }
+        candidates_by_id[transform.candidate_id] = candidate
 
     oa_dir = output_dir / "prealign_orient_anything"
     oa_dir.mkdir(parents=True, exist_ok=True)
-    if best_record is None or best_aligned is None:
-        payload["selected"] = None
-        payload["reason"] = "No candidate met Orient Anything confidence threshold."
-        (oa_dir / "orient_prealign_result.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        log("[prealign:oa] No high-confidence candidate; falling back to VLM pre-align.")
-        return None
 
-    selected_id = int(best_record["candidate_id"])
+    max_candidate_id = len(transforms) - 1
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": PREALIGN_OA_VLM_SELECT_SYSTEM}]},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": PREALIGN_OA_VLM_SELECT_USER.format(
+                        target_orientation=_format_orient_prediction_line(target_prediction),
+                        candidate_orientation_table=_format_orient_candidate_orientation_table(
+                            candidate_records
+                        ),
+                        max_candidate_id=max_candidate_id,
+                    ),
+                },
+            ],
+        },
+    ]
+    vlm_response = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
+    raw_id = vlm_response.get("best_candidate_id", 0)
+    try:
+        best_id = int(raw_id)
+    except (TypeError, ValueError):
+        best_id = 0
+    best_id = max(0, min(max_candidate_id, best_id))
+
     chosen_transform = next(
-        transform for transform in transforms if transform.candidate_id == selected_id
+        transform for transform in transforms if transform.candidate_id == best_id
     )
+    best_aligned = candidates_by_id[best_id]
+    best_record = next(
+        record for record in candidate_records if record["candidate_id"] == best_id
+    )
+
     chosen_path = oa_dir / "selected_candidate.png"
     save_image(best_aligned, chosen_path)
     confidence = min(
@@ -2639,30 +2718,46 @@ def orient_anything_pre_align_source(
         should_horizontal_flip=chosen_transform.flip_horizontal,
         rotation_degrees=float(chosen_transform.rotation_degrees),
         confidence=confidence,
-        reason=(
-            "Orient Anything selected the coarse flip/rotate candidate with the "
-            "smallest orientation delta to TARGET."
+        reason=str(vlm_response.get("reason", "")).strip()
+        or (
+            "VLM selected the Orient Anything candidate whose azimuth/polar/rotation "
+            "is closest to TARGET."
         ),
         applied_horizontal_flip=chosen_transform.flip_horizontal,
         applied_vertical_flip=chosen_transform.flip_vertical,
         applied_rotation_degrees=float(chosen_transform.rotation_degrees),
     )
-    payload["selected"] = {
-        "candidate_id": selected_id,
-        "chosen_transform": asdict(chosen_transform),
-        "image_path": str(chosen_path),
-        "decision": asdict(decision),
-        "deltas": best_record["deltas"],
+    payload: dict[str, Any] = {
+        "mode": "orient_anything_pre_align",
+        "selection": "vlm_on_oa_angles",
+        "num_raw_candidates": raw_count,
+        "num_candidates": len(transforms),
+        "confidence_threshold": confidence_threshold,
+        "confidence_gate": False,
+        "target_prediction": asdict(target_prediction),
+        "candidate_records": candidate_records,
+        "vlm_response": vlm_response,
+        "selected": {
+            "candidate_id": best_id,
+            "chosen_transform": asdict(chosen_transform),
+            "image_path": str(chosen_path),
+            "decision": asdict(decision),
+            "deltas": best_record["deltas"],
+            "confidence_ok": best_record["confidence_ok"],
+        },
     }
     (oa_dir / "orient_prealign_result.json").write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     log(
-        "[prealign:oa] Selected "
-        f"candidate {selected_id}: flip_h={chosen_transform.flip_horizontal}, "
+        "[prealign:oa] VLM selected "
+        f"candidate {best_id}: flip_h={chosen_transform.flip_horizontal}, "
         f"flip_v={chosen_transform.flip_vertical}, rotate={chosen_transform.rotation_degrees}°, "
-        f"azimuth_delta={best_record['deltas']['azimuth_delta']:.1f}°"
+        f"azimuth_delta={best_record['deltas']['azimuth_delta']:.1f}°, "
+        f"polar_delta={best_record['deltas']['polar_delta']:.1f}°, "
+        f"rotation_delta={best_record['deltas']['rotation_delta']:.1f}° "
+        f"(confidence_ok={best_record['confidence_ok']})"
     )
     return best_aligned, decision, payload
 
@@ -2906,6 +3001,7 @@ def pre_align_source_until_verified(
                 source_img=source_img,
                 target_img=target_img,
                 orient_anything=orient_anything,
+                planner_vlm=planner_vlm,
                 output_dir=output_dir,
                 confidence_threshold=orient_confidence_threshold,
             )
