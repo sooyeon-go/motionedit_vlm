@@ -327,10 +327,30 @@ def write_summary(
 ) -> dict[str, Any]:
     ok_records = [record for record in all_records if record.get("status") == "ok"]
     by_stride_records: dict[int, list[dict[str, Any]]] = {stride: [] for stride in strides}
+    by_sequence_records: dict[str, list[dict[str, Any]]] = {}
     for record in ok_records:
         stride = int(record["stride"])
         if stride in by_stride_records:
             by_stride_records[stride].append(record)
+        sequence_name = str(record.get("sequence", "unknown"))
+        by_sequence_records.setdefault(sequence_name, []).append(record)
+
+    by_sequence: dict[str, Any] = {}
+    for sequence_name in sorted(by_sequence_records):
+        seq_records = by_sequence_records[sequence_name]
+        seq_by_stride: dict[int, list[dict[str, Any]]] = {stride: [] for stride in strides}
+        for record in seq_records:
+            stride = int(record["stride"])
+            if stride in seq_by_stride:
+                seq_by_stride[stride].append(record)
+        by_sequence[sequence_name] = {
+            **aggregate_records(seq_records),
+            "by_stride": {
+                str(stride): aggregate_records(records)
+                for stride, records in seq_by_stride.items()
+                if records
+            },
+        }
 
     payload = {
         "frames_root": str(frames_root),
@@ -349,6 +369,7 @@ def write_summary(
             str(stride): aggregate_records(records)
             for stride, records in by_stride_records.items()
         },
+        "by_sequence": by_sequence,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -445,6 +466,16 @@ def launch_multi_gpu(args: argparse.Namespace, jobs: list[dict[str, Any]], gpu_i
         raise RuntimeError(f"One or more workers failed: exit_codes={exit_codes}")
 
     all_records = merge_jsonl_files(shard_paths, jsonl_path)
+    for shard_path in shard_paths:
+        try:
+            shard_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        jobs_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     frames_root = args.frames_root.expanduser().resolve()
     sequence_dirs = list_sequence_dirs(frames_root, parse_sequences(args.sequences))
     payload = write_summary(
