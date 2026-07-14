@@ -216,14 +216,33 @@ def rate(records: list[dict[str, Any]], key: str) -> float | None:
 
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     mode_counts: dict[str, int] = {}
+    recovered_sequences: list[str] = []
+    failed_sequences: list[str] = []
+    seen_recovered: set[str] = set()
+    seen_failed: set[str] = set()
     for record in records:
         mode = str(record.get("prealign_mode", "unknown"))
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        sequence = str(record.get("sequence", "unknown"))
+        if record.get("recovered") is True:
+            if sequence not in seen_recovered:
+                seen_recovered.add(sequence)
+                recovered_sequences.append(sequence)
+        elif record.get("recovered") is False:
+            if sequence not in seen_failed:
+                seen_failed.add(sequence)
+                failed_sequences.append(sequence)
+    recovered_sequences.sort()
+    failed_sequences.sort()
     return {
         "num_samples": len(records),
         "recovery_rate": rate(records, "recovered"),
         "verify_apply_rate": rate(records, "verify_apply"),
         "mode_counts": mode_counts,
+        "recovered_sequences": recovered_sequences,
+        "failed_sequences": failed_sequences,
+        "num_recovered_sequences": len(recovered_sequences),
+        "num_failed_sequences": len(failed_sequences),
     }
 
 
@@ -477,6 +496,53 @@ def run_worker(
 # ------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------
+def load_jsonl_records(jsonl_path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def rebuild_summary_from_jsonl(
+    *,
+    jsonl_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    all_records = load_jsonl_records(jsonl_path)
+    ok_records = [record for record in all_records if record.get("status") == "ok"]
+    strides_from_data = sorted(
+        {
+            int(record["stride"])
+            for record in ok_records
+            if "stride" in record
+        }
+    )
+    strides = strides_from_data or parse_strides(args.strides)
+    sequences = sorted(
+        {
+            str(record.get("sequence"))
+            for record in ok_records
+            if record.get("sequence")
+        }
+    )
+    started = time.time()
+    return write_summary(
+        args=args,
+        strides=strides,
+        jsonl_path=jsonl_path,
+        output_path=output_path,
+        started=started,
+        num_sequences=len(sequences),
+        all_records=all_records,
+        gpu_ids=parse_gpu_ids(args.gpus),
+    )
+
+
 def write_summary(
     *,
     args: argparse.Namespace,
@@ -692,6 +758,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--perturb_seed", type=int, default=0)
     parser.add_argument("--gpus", default=DEFAULT_GPUS, help="GPU ids. Default: 0-7 (8 GPUs).")
     parser.add_argument("--jsonl_path", type=Path, default=None)
+    parser.add_argument(
+        "--rebuild_from_jsonl",
+        type=Path,
+        default=None,
+        help="Rebuild summary.json (with recovered/failed lists) from an existing jsonl; skip VLM.",
+    )
     parser.add_argument("--no_save_images", action="store_true", help="Do not save per-sample PNGs.")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -735,6 +807,27 @@ def main() -> None:
     )
     samples_root = output_path.parent / "samples"
     strides = parse_strides(args.strides)
+
+    if args.rebuild_from_jsonl is not None:
+        rebuild_path = args.rebuild_from_jsonl.expanduser().resolve()
+        if not rebuild_path.is_file():
+            raise FileNotFoundError(f"jsonl not found: {rebuild_path}")
+        payload = rebuild_summary_from_jsonl(
+            jsonl_path=rebuild_path,
+            output_path=output_path,
+            args=args,
+        )
+        print(f"[prealign-eval] rebuilt summary: {output_path}", flush=True)
+        print(
+            f"[prealign-eval] overall recovery_rate: {payload['overall']['recovery_rate']}",
+            flush=True,
+        )
+        print(
+            f"[prealign-eval] recovered={payload['overall']['num_recovered_sequences']} "
+            f"failed={payload['overall']['num_failed_sequences']}",
+            flush=True,
+        )
+        return
 
     # Worker mode.
     if args.worker_id is not None:
