@@ -2,7 +2,9 @@
 """Test the pre-align module's ability to recover a known random flip/rotation on DAVIS.
 
 Experiment (per DAVIS sequence, per stride S):
-  1. source = frame_0, target = frame_S  (video first frame vs the frame S steps later).
+  1. source = frame_0 (always the first frame).
+     target = the last frame reachable by hopping with stride S from frame_0
+     (indices 0, S, 2S, ... → last of those; not merely frame_S).
      Real video frames of the same object are assumed to be roughly orientation-aligned,
      so the "correct" pre-align of a perturbed source is to undo the perturbation.
   2. Apply a RANDOM coarse D4 transform (horizontal/vertical flip x {0,90,180,270}
@@ -103,13 +105,20 @@ def list_frames(sequence_dir: Path) -> list[Path]:
 
 
 def target_index(num_frames: int, stride: int, target_mode: str) -> int:
+    """Pick target frame index for (source=frame_0, target=...).
+
+    last_strided (default): last index reachable by hopping 0, S, 2S, ...
+        i.e. floor((N-1)/S)*S. Differs by stride; equals true last when S=1.
+    last: always the true final frame N-1 (stride-independent).
+    stride: only frame_S (early short gap; kept for ablations).
+    """
     last = num_frames - 1
-    if target_mode == "stride":
-        return min(stride, last)
-    if target_mode == "last":
-        return last
     if target_mode == "last_strided":
         return (last // stride) * stride
+    if target_mode == "last":
+        return last
+    if target_mode == "stride":
+        return min(stride, last)
     raise ValueError(f"Unknown target_mode: {target_mode}")
 
 
@@ -660,7 +669,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Test pre-align recovery of a known random flip/rotation on DAVIS "
-            "(source=frame_0, target=frame_S), with optional multi-GPU sharding."
+            "(source=frame_0, target=last frame reachable at stride S), "
+            "with optional multi-GPU sharding."
         ),
     )
     parser.add_argument("--frames_root", type=Path, default=DEFAULT_DAVIS_ROOT)
@@ -671,10 +681,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sequences", default=None, help="Comma-separated names. Default: ALL.")
     parser.add_argument(
         "--target_mode",
-        choices=("stride", "last", "last_strided"),
-        default="stride",
-        help="Target frame: 'stride'=frame_S (default), 'last'=final frame, "
-        "'last_strided'=last multiple of stride.",
+        choices=("last_strided", "last", "stride"),
+        default="last_strided",
+        help=(
+            "Target frame. Default 'last_strided'=last frame reachable by hopping "
+            "with stride S from frame_0 (0,S,2S,...). "
+            "'last'=true final frame. 'stride'=only frame_S (ablation)."
+        ),
     )
     parser.add_argument("--perturb_seed", type=int, default=0)
     parser.add_argument("--gpus", default=DEFAULT_GPUS, help="GPU ids. Default: 0-7 (8 GPUs).")
