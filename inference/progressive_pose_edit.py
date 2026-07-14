@@ -501,7 +501,7 @@ Return this exact JSON:
 {{
   "overall_ok": true,
   "closer_to_target_orientation": true,
-  "landmark_axis_improved": true,
+  "coarse_orientation_improved": true,
   "not_over_transformed": true,
   "recommendation": "apply | rollback | retry",
   "failure_reason": "short reason if not overall_ok"
@@ -509,9 +509,8 @@ Return this exact JSON:
 
 Rules:
 - overall_ok=true only if ALIGNED SOURCE is a better starting point than ORIGINAL SOURCE.
-- If no transform was applied because no reliable shared two-landmark axis exists, accept it when ORIGINAL SOURCE is the safer starting point.
 - rollback means the transform made orientation worse.
-- retry means the decision likely chose poor landmarks or wrong flip/rotation.
+- retry means another D4 flip/rotation candidate may be better.
 - Do NOT check cropping: transforms are flip/rotate only and cannot crop content."""
 
 PREALIGN_BRUTEFORCE_SYSTEM = """You are a coarse orientation matcher.
@@ -529,12 +528,16 @@ Ignore texture/color/identity differences; focus on geometry and viewing directi
 
 Return this exact JSON:
 {{
+  "can_select": true,
   "best_candidate_id": 0,
+  "alternative_candidate_id": 1,
   "reason": "short reason"
 }}
 
 Rules:
-- best_candidate_id must be an integer in [0, {max_candidate_id}].
+- If orientation cannot be distinguished reliably, return can_select=false and null IDs.
+- Otherwise best_candidate_id must be an integer in [0, {max_candidate_id}].
+- alternative_candidate_id should be the next-best different candidate, or null.
 - Prefer the candidate that would need the smallest later pose edit to reach TARGET."""
 
 PREALIGN_OA_VLM_SELECT_SYSTEM = """You are a coarse orientation matcher using Orient Anything measurements.
@@ -555,12 +558,17 @@ Ignore texture/identity; this is only coarse D4 orientation matching.
 
 Return this exact JSON:
 {{
+  "can_select": true,
   "best_candidate_id": 0,
+  "alternative_candidate_id": 1,
   "reason": "short reason using the given angles"
 }}
 
 Rules:
-- best_candidate_id must be an integer in [0, {max_candidate_id}].
+- Return can_select=false and null IDs if the measurements are contradictory, unstable,
+  or do not distinguish a defensible candidate.
+- Otherwise best_candidate_id must be an integer in [0, {max_candidate_id}].
+- alternative_candidate_id should be the next-best different candidate, or null.
 - Prefer smaller absolute azimuth/polar/rotation gaps to TARGET.
 - Do not invent candidates outside the table."""
 
@@ -2627,6 +2635,16 @@ def _format_orient_candidate_orientation_table(
     return "\n".join(lines)
 
 
+def _parse_candidate_id(value: Any, valid_ids: set[int]) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        candidate_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return candidate_id if candidate_id in valid_ids else None
+
+
 def orient_anything_pre_align_source(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -2693,12 +2711,40 @@ def orient_anything_pre_align_source(
         },
     ]
     vlm_response = parse_json(planner_vlm.chat(messages, max_new_tokens=512))
-    raw_id = vlm_response.get("best_candidate_id", 0)
-    try:
-        best_id = int(raw_id)
-    except (TypeError, ValueError):
-        best_id = 0
-    best_id = max(0, min(max_candidate_id, best_id))
+    valid_ids = {transform.candidate_id for transform in transforms}
+    can_select = vlm_response.get("can_select") is True
+    best_id = _parse_candidate_id(vlm_response.get("best_candidate_id"), valid_ids)
+    alternative_id = _parse_candidate_id(
+        vlm_response.get("alternative_candidate_id"),
+        valid_ids,
+    )
+    if alternative_id == best_id:
+        alternative_id = None
+
+    if not can_select or best_id is None:
+        payload: dict[str, Any] = {
+            "mode": "orient_anything_pre_align",
+            "selection": "vlm_on_oa_angles",
+            "num_raw_candidates": raw_count,
+            "num_candidates": len(transforms),
+            "confidence_threshold": confidence_threshold,
+            "confidence_gate": False,
+            "target_prediction": asdict(target_prediction),
+            "candidate_records": candidate_records,
+            "vlm_response": vlm_response,
+            "selected": None,
+            "reason": (
+                "VLM abstained from OA-angle selection."
+                if not can_select
+                else "VLM returned an invalid OA candidate ID."
+            ),
+        }
+        (oa_dir / "orient_prealign_result.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log(f"[prealign:oa] {payload['reason']} Falling back to visual candidates.")
+        return None
 
     chosen_transform = next(
         transform for transform in transforms if transform.candidate_id == best_id
@@ -2739,6 +2785,7 @@ def orient_anything_pre_align_source(
         "vlm_response": vlm_response,
         "selected": {
             "candidate_id": best_id,
+            "alternative_candidate_id": alternative_id,
             "chosen_transform": asdict(chosen_transform),
             "image_path": str(chosen_path),
             "decision": asdict(decision),
@@ -2767,13 +2814,13 @@ def bruteforce_pre_align_source(
     target_img: Image.Image,
     planner_vlm: QwenVLMClient,
     output_dir: Path,
-) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
+) -> Optional[tuple[Image.Image, PreAlignDecision, dict[str, Any]]]:
     transforms, raw_count = enumerate_unique_coarse_orientation_transforms(source_img)
     if not transforms:
         raise RuntimeError("No coarse orientation candidates generated for bruteforce fallback.")
 
     log(
-        "\n========== Phase -1B: Bruteforce Orientation Fallback "
+        "\n========== Phase -1C: Visual D4 Orientation Fallback "
         f"({len(transforms)} unique / {raw_count} raw combos) =========="
     )
 
@@ -2827,13 +2874,43 @@ def bruteforce_pre_align_source(
         },
     ]
     parsed = parse_json(planner_vlm.chat(messages, max_new_tokens=768))
-    raw_id = parsed.get("best_candidate_id", 0)
-    try:
-        best_id = int(raw_id)
-    except (TypeError, ValueError):
-        best_id = 0
-    best_id = max(0, min(len(transforms) - 1, best_id))
-    chosen_transform = transforms[best_id]
+    valid_ids = {transform.candidate_id for transform in transforms}
+    can_select = parsed.get("can_select") is True
+    best_id = _parse_candidate_id(parsed.get("best_candidate_id"), valid_ids)
+    alternative_id = _parse_candidate_id(
+        parsed.get("alternative_candidate_id"),
+        valid_ids,
+    )
+    if alternative_id == best_id:
+        alternative_id = None
+
+    if not can_select or best_id is None:
+        payload = {
+            "mode": "bruteforce_fallback",
+            "num_raw_candidates": raw_count,
+            "num_candidates": len(transforms),
+            "best_candidate_id": None,
+            "alternative_candidate_id": None,
+            "candidate_records": candidate_records,
+            "grid_path": str(grid_path),
+            "vlm_response": parsed,
+            "decision": None,
+            "reason": (
+                "VLM abstained from visual candidate selection."
+                if not can_select
+                else "VLM returned an invalid visual candidate ID."
+            ),
+        }
+        (bruteforce_dir / "bruteforce_result.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log(f"[prealign:bruteforce] {payload['reason']}")
+        return None
+
+    chosen_transform = next(
+        transform for transform in transforms if transform.candidate_id == best_id
+    )
     aligned = candidates[best_id]
 
     decision = PreAlignDecision(
@@ -2851,6 +2928,7 @@ def bruteforce_pre_align_source(
         "num_raw_candidates": raw_count,
         "num_candidates": len(transforms),
         "best_candidate_id": best_id,
+        "alternative_candidate_id": alternative_id,
         "chosen_transform": asdict(chosen_transform),
         "candidate_records": candidate_records,
         "grid_path": str(grid_path),
@@ -2878,6 +2956,7 @@ def pre_align_source(
     max_rotation: float,
     retry_feedback: str = "",
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
+    """Legacy landmark selector retained for compatibility; the A→C path does not call it."""
     log("\n========== Phase -1: Coarse Orientation Pre-Alignment ==========")
     log("[prealign] Selecting a two-landmark axis and comparing source vs target...")
     t0 = time.time()
@@ -2992,9 +3071,14 @@ def pre_align_source_until_verified(
     orient_anything: Optional[OrientAnythingClient] = None,
     orient_confidence_threshold: float = 0.5,
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
-    attempt = 0
-    feedback = ""
-    retry_cap = max_attempts if max_attempts > 0 else bruteforce_after_attempts
+    # Kept in the signature for compatibility with existing callers. The A→C
+    # pipeline no longer performs landmark retries.
+    del min_confidence, max_rotation, max_attempts, bruteforce_after_attempts
+
+    oa_payload: Optional[dict[str, Any]] = None
+    fallback_reason = (
+        "Orient Anything is disabled; run visual candidate selection directly."
+    )
     if orient_anything is not None:
         try:
             oa_result = orient_anything_pre_align_source(
@@ -3007,85 +3091,143 @@ def pre_align_source_until_verified(
             )
         except Exception as exc:
             oa_result = None
-            feedback = f"Orient Anything pre-align failed: {exc}"
+            fallback_reason = f"Orient Anything pre-align failed: {exc}"
             log(f"[prealign:oa] Failed: {exc}")
 
         if oa_result is not None:
-            aligned, decision, parsed = oa_result
+            aligned, decision, oa_payload = oa_result
             verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
-            parsed["verify"] = asdict(verify)
-            parsed["phase"] = "orient_anything_pre_align"
+            oa_payload["verify"] = asdict(verify)
+            oa_payload["phase"] = "orient_anything_pre_align"
             (output_dir / "pre_alignment.json").write_text(
-                json.dumps(parsed, indent=2, ensure_ascii=False),
+                json.dumps(oa_payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
             if verify.overall_ok and verify.recommendation == "apply":
                 log("[prealign:oa] Verify PASSED; applying Orient Anything aligned source.")
-                return aligned, decision, parsed
-            if verify.overall_ok and verify.recommendation == "rollback":
-                log("[prealign:oa] Verify accepted rollback; using original source.")
-                decision.applied_horizontal_flip = False
-                decision.applied_vertical_flip = False
-                decision.applied_rotation_degrees = 0.0
-                parsed["rolled_back"] = True
-                return source_img, decision, parsed
-            feedback = (
+                return aligned, decision, oa_payload
+            fallback_reason = (
                 verify.failure_reason
-                or "Orient Anything pre-align verification failed; fall back to VLM landmarks."
+                or (
+                    "Orient Anything candidate failed image verification "
+                    f"({verify.recommendation}); use visual candidate selection."
+                )
             )
-            log(f"[prealign:oa] Verify FAILED: {feedback}")
+            log(f"[prealign:oa] Verify did not pass; falling back to visual candidates: {fallback_reason}")
+        else:
+            oa_artifact = output_dir / "prealign_orient_anything" / "orient_prealign_result.json"
+            if oa_artifact.is_file():
+                try:
+                    oa_payload = json.loads(oa_artifact.read_text(encoding="utf-8"))
+                    fallback_reason = str(oa_payload.get("reason") or fallback_reason)
+                except (OSError, json.JSONDecodeError):
+                    pass
 
-    while True:
-        attempt += 1
-        log(f"\n[prealign] Verified attempt {attempt}/{retry_cap}")
-        aligned, decision, parsed = pre_align_source(
-            source_img=source_img,
-            target_img=target_img,
-            planner_vlm=planner_vlm,
-            output_dir=output_dir,
-            min_confidence=min_confidence,
-            max_rotation=max_rotation,
-            retry_feedback=feedback,
+    log("\n========== Phase -1C: Visual D4 Candidate Selection ==========")
+    bruteforce_result = bruteforce_pre_align_source(
+        source_img=source_img,
+        target_img=target_img,
+        planner_vlm=planner_vlm,
+        output_dir=output_dir,
+    )
+    if bruteforce_result is None:
+        decision = PreAlignDecision(
+            should_horizontal_flip=False,
+            rotation_degrees=0.0,
+            confidence=0.0,
+            reason="Visual candidate selector abstained; preserve the original source.",
         )
-        if feedback:
-            parsed["retry_feedback"] = feedback
-
-        verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
-        parsed["verify"] = asdict(verify)
+        parsed = {
+            "mode": "a_to_c_pre_align",
+            "phase": "rolled_back",
+            "orient_anything": oa_payload,
+            "fallback_reason": fallback_reason,
+            "bruteforce_fallback": None,
+            "rolled_back": True,
+            "decision": asdict(decision),
+        }
         (output_dir / "pre_alignment.json").write_text(
             json.dumps(parsed, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        if verify.overall_ok and verify.recommendation == "apply":
-            log("[prealign] Verify PASSED; applying aligned source.")
-            return aligned, decision, parsed
-        if verify.overall_ok and verify.recommendation == "rollback":
-            log("[prealign] Verify accepted rollback; using original source.")
-            decision.applied_horizontal_flip = False
-            decision.applied_vertical_flip = False
-            decision.applied_rotation_degrees = 0.0
-            parsed["rolled_back"] = True
-            return source_img, decision, parsed
+        return source_img, decision, parsed
 
-        feedback = verify.failure_reason or "Pre-align verification failed; choose safer landmarks or skip transform."
-        log(f"[prealign] Verify FAILED: {feedback}")
-        if attempt >= retry_cap:
-            log(
-                f"[prealign] Landmark-based pre-align failed after {attempt} attempt(s); "
-                f"running bruteforce fallback with unique flip/rotate candidates."
-            )
-            aligned, decision, bruteforce_payload = bruteforce_pre_align_source(
-                source_img=source_img,
-                target_img=target_img,
-                planner_vlm=planner_vlm,
-                output_dir=output_dir,
-            )
-            parsed["bruteforce_fallback"] = bruteforce_payload
+    aligned, decision, bruteforce_payload = bruteforce_result
+    verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
+    bruteforce_payload["verify"] = asdict(verify)
+    parsed = {
+        "mode": "a_to_c_pre_align",
+        "phase": "bruteforce_fallback",
+        "orient_anything": oa_payload,
+        "fallback_reason": fallback_reason,
+        "bruteforce_fallback": bruteforce_payload,
+        "verify": asdict(verify),
+    }
+    if verify.overall_ok and verify.recommendation == "apply":
+        log("[prealign:bruteforce] Verify PASSED; applying visual candidate.")
+        (output_dir / "pre_alignment.json").write_text(
+            json.dumps(parsed, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return aligned, decision, parsed
+
+    alternative_id = bruteforce_payload.get("alternative_candidate_id")
+    transforms, _ = enumerate_unique_coarse_orientation_transforms(source_img)
+    transform_by_id = {transform.candidate_id: transform for transform in transforms}
+    alternative_transform = transform_by_id.get(alternative_id)
+    if alternative_transform is not None:
+        alternative_aligned = apply_coarse_orientation_transform(
+            source_img=source_img,
+            transform=alternative_transform,
+        )
+        alternative_decision = PreAlignDecision(
+            should_horizontal_flip=alternative_transform.flip_horizontal,
+            rotation_degrees=float(alternative_transform.rotation_degrees),
+            confidence=1.0,
+            reason=(
+                "Visual selector's alternative candidate, tested after the primary "
+                "candidate failed verification."
+            ),
+            applied_horizontal_flip=alternative_transform.flip_horizontal,
+            applied_vertical_flip=alternative_transform.flip_vertical,
+            applied_rotation_degrees=float(alternative_transform.rotation_degrees),
+        )
+        alternative_verify = verify_pre_alignment(
+            source_img,
+            alternative_aligned,
+            target_img,
+            alternative_decision,
+            planner_vlm,
+        )
+        parsed["alternative_attempt"] = {
+            "candidate_id": alternative_id,
+            "chosen_transform": asdict(alternative_transform),
+            "decision": asdict(alternative_decision),
+            "verify": asdict(alternative_verify),
+        }
+        if alternative_verify.overall_ok and alternative_verify.recommendation == "apply":
+            log("[prealign:bruteforce] Alternative verify PASSED; applying alternative candidate.")
             (output_dir / "pre_alignment.json").write_text(
                 json.dumps(parsed, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            return aligned, decision, parsed
+            return alternative_aligned, alternative_decision, parsed
+
+    decision.applied_horizontal_flip = False
+    decision.applied_vertical_flip = False
+    decision.applied_rotation_degrees = 0.0
+    parsed["phase"] = "rolled_back"
+    parsed["rolled_back"] = True
+    parsed["rollback_reason"] = (
+        verify.failure_reason
+        or "Visual candidate and its available alternative did not pass verification."
+    )
+    log("[prealign] No visual candidate passed verification; preserving original source.")
+    (output_dir / "pre_alignment.json").write_text(
+        json.dumps(parsed, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return source_img, decision, parsed
 
 
 def plan(

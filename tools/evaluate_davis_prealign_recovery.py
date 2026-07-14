@@ -255,13 +255,13 @@ def sample_perturbation(sequence: str, stride: int, perturb_seed: int) -> tuple[
 
 
 def derive_prealign_mode(parsed: dict[str, Any]) -> str:
-    if parsed.get("bruteforce_fallback"):
-        return "bruteforce"
     if parsed.get("rolled_back"):
         return "rolled_back"
     if parsed.get("phase") == "orient_anything_pre_align":
         return "orient_anything"
-    return "landmark"
+    if parsed.get("phase") == "bruteforce_fallback":
+        return "bruteforce"
+    return "unknown"
 
 
 def evaluate_sample(
