@@ -2545,6 +2545,128 @@ def _format_coarse_candidate_table(transforms: list[CoarseOrientationTransform])
     return "\n".join(f"- {transform.label}" for transform in transforms)
 
 
+def _orient_candidate_score(
+    candidate: OrientAnythingPrediction,
+    target: OrientAnythingPrediction,
+) -> dict[str, float]:
+    azimuth_delta = _circular_degree_distance(candidate.azimuth, target.azimuth)
+    polar_delta = abs(candidate.polar - target.polar)
+    rotation_delta = _circular_degree_distance(candidate.rotation, target.rotation)
+    # Azimuth is the primary pre-align signal; polar/rotation only break ties.
+    score = azimuth_delta + 0.25 * polar_delta + 0.10 * rotation_delta
+    return {
+        "score": score,
+        "azimuth_delta": azimuth_delta,
+        "polar_delta": polar_delta,
+        "rotation_delta": rotation_delta,
+    }
+
+
+def orient_anything_pre_align_source(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    orient_anything: OrientAnythingClient,
+    output_dir: Path,
+    confidence_threshold: float,
+) -> Optional[tuple[Image.Image, PreAlignDecision, dict[str, Any]]]:
+    log("\n========== Phase -1A: Orient Anything Pre-Alignment ==========")
+    transforms, raw_count = enumerate_unique_coarse_orientation_transforms(source_img)
+    if not transforms:
+        log("[prealign:oa] No coarse orientation candidates generated.")
+        return None
+
+    target_prediction = orient_anything.predict(target_img)
+    candidate_records: list[dict[str, Any]] = []
+    best_record: Optional[dict[str, Any]] = None
+    best_aligned: Optional[Image.Image] = None
+
+    for transform in transforms:
+        candidate = apply_coarse_orientation_transform(source_img, transform)
+        prediction = orient_anything.predict(candidate)
+        deltas = _orient_candidate_score(prediction, target_prediction)
+        confidence_ok = (
+            prediction.confidence >= confidence_threshold
+            and target_prediction.confidence >= confidence_threshold
+        )
+        record = {
+            "candidate_id": transform.candidate_id,
+            "flip_horizontal": transform.flip_horizontal,
+            "flip_vertical": transform.flip_vertical,
+            "rotation_degrees": transform.rotation_degrees,
+            "prediction": asdict(prediction),
+            "deltas": deltas,
+            "confidence_ok": confidence_ok,
+        }
+        candidate_records.append(record)
+        if not confidence_ok:
+            continue
+        if best_record is None or deltas["score"] < best_record["deltas"]["score"]:
+            best_record = record
+            best_aligned = candidate
+
+    payload: dict[str, Any] = {
+        "mode": "orient_anything_pre_align",
+        "num_raw_candidates": raw_count,
+        "num_candidates": len(transforms),
+        "confidence_threshold": confidence_threshold,
+        "target_prediction": asdict(target_prediction),
+        "candidate_records": candidate_records,
+    }
+
+    oa_dir = output_dir / "prealign_orient_anything"
+    oa_dir.mkdir(parents=True, exist_ok=True)
+    if best_record is None or best_aligned is None:
+        payload["selected"] = None
+        payload["reason"] = "No candidate met Orient Anything confidence threshold."
+        (oa_dir / "orient_prealign_result.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log("[prealign:oa] No high-confidence candidate; falling back to VLM pre-align.")
+        return None
+
+    selected_id = int(best_record["candidate_id"])
+    chosen_transform = next(
+        transform for transform in transforms if transform.candidate_id == selected_id
+    )
+    chosen_path = oa_dir / "selected_candidate.png"
+    save_image(best_aligned, chosen_path)
+    confidence = min(
+        float(best_record["prediction"]["confidence"]),
+        float(target_prediction.confidence),
+    )
+    decision = PreAlignDecision(
+        should_horizontal_flip=chosen_transform.flip_horizontal,
+        rotation_degrees=float(chosen_transform.rotation_degrees),
+        confidence=confidence,
+        reason=(
+            "Orient Anything selected the coarse flip/rotate candidate with the "
+            "smallest orientation delta to TARGET."
+        ),
+        applied_horizontal_flip=chosen_transform.flip_horizontal,
+        applied_vertical_flip=chosen_transform.flip_vertical,
+        applied_rotation_degrees=float(chosen_transform.rotation_degrees),
+    )
+    payload["selected"] = {
+        "candidate_id": selected_id,
+        "chosen_transform": asdict(chosen_transform),
+        "image_path": str(chosen_path),
+        "decision": asdict(decision),
+        "deltas": best_record["deltas"],
+    }
+    (oa_dir / "orient_prealign_result.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    log(
+        "[prealign:oa] Selected "
+        f"candidate {selected_id}: flip_h={chosen_transform.flip_horizontal}, "
+        f"flip_v={chosen_transform.flip_vertical}, rotate={chosen_transform.rotation_degrees}°, "
+        f"azimuth_delta={best_record['deltas']['azimuth_delta']:.1f}°"
+    )
+    return best_aligned, decision, payload
+
+
 def bruteforce_pre_align_source(
     source_img: Image.Image,
     target_img: Image.Image,
@@ -2772,10 +2894,51 @@ def pre_align_source_until_verified(
     max_rotation: float,
     max_attempts: int = 0,
     bruteforce_after_attempts: int = 5,
+    orient_anything: Optional[OrientAnythingClient] = None,
+    orient_confidence_threshold: float = 0.5,
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
     attempt = 0
     feedback = ""
     retry_cap = max_attempts if max_attempts > 0 else bruteforce_after_attempts
+    if orient_anything is not None:
+        try:
+            oa_result = orient_anything_pre_align_source(
+                source_img=source_img,
+                target_img=target_img,
+                orient_anything=orient_anything,
+                output_dir=output_dir,
+                confidence_threshold=orient_confidence_threshold,
+            )
+        except Exception as exc:
+            oa_result = None
+            feedback = f"Orient Anything pre-align failed: {exc}"
+            log(f"[prealign:oa] Failed: {exc}")
+
+        if oa_result is not None:
+            aligned, decision, parsed = oa_result
+            verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
+            parsed["verify"] = asdict(verify)
+            parsed["phase"] = "orient_anything_pre_align"
+            (output_dir / "pre_alignment.json").write_text(
+                json.dumps(parsed, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if verify.overall_ok and verify.recommendation == "apply":
+                log("[prealign:oa] Verify PASSED; applying Orient Anything aligned source.")
+                return aligned, decision, parsed
+            if verify.overall_ok and verify.recommendation == "rollback":
+                log("[prealign:oa] Verify accepted rollback; using original source.")
+                decision.applied_horizontal_flip = False
+                decision.applied_vertical_flip = False
+                decision.applied_rotation_degrees = 0.0
+                parsed["rolled_back"] = True
+                return source_img, decision, parsed
+            feedback = (
+                verify.failure_reason
+                or "Orient Anything pre-align verification failed; fall back to VLM landmarks."
+            )
+            log(f"[prealign:oa] Verify FAILED: {feedback}")
+
     while True:
         attempt += 1
         log(f"\n[prealign] Verified attempt {attempt}/{retry_cap}")
@@ -4988,6 +5151,27 @@ def main() -> None:
     )
     log(f"[load] Planner VLM ready ({time.time() - t0:.1f}s)")
 
+    orient_anything: Optional[OrientAnythingClient] = None
+    if args.use_orient_anything:
+        log("[load] Orient Anything geometry estimator...")
+        t0 = time.time()
+        orient_anything = OrientAnythingClient(
+            repo_dir=Path(args.orient_anything_repo),
+            checkpoint_path=(
+                Path(args.orient_anything_ckpt)
+                if args.orient_anything_ckpt is not None
+                else None
+            ),
+            model_size=args.orient_anything_model_size,
+            device=args.device,
+            cache_dir=(
+                Path(args.orient_anything_cache_dir)
+                if args.orient_anything_cache_dir is not None
+                else None
+            ),
+        )
+        log(f"[load] Orient Anything ready ({time.time() - t0:.1f}s)")
+
     aligned_source_img = source_img
     pre_alignment: Optional[PreAlignDecision] = None
     if args.skip_pre_align:
@@ -5003,6 +5187,8 @@ def main() -> None:
             max_rotation=args.max_pre_align_rotation,
             max_attempts=args.max_prealign_verify_attempts,
             bruteforce_after_attempts=args.prealign_bruteforce_after_attempts,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
         save_image(aligned_source_img, output_dir / "aligned_source.png")
         save_image(aligned_source_img, output_dir / "step_00.png")
@@ -5036,27 +5222,6 @@ def main() -> None:
     t0 = time.time()
     identity_scorer = DINOv2IdentityScorer(args.dinov2_model, args.device)
     log(f"[load] DINOv2 ready ({time.time() - t0:.1f}s)")
-
-    orient_anything: Optional[OrientAnythingClient] = None
-    if args.use_orient_anything:
-        log("[load] Orient Anything geometry estimator...")
-        t0 = time.time()
-        orient_anything = OrientAnythingClient(
-            repo_dir=Path(args.orient_anything_repo),
-            checkpoint_path=(
-                Path(args.orient_anything_ckpt)
-                if args.orient_anything_ckpt is not None
-                else None
-            ),
-            model_size=args.orient_anything_model_size,
-            device=args.device,
-            cache_dir=(
-                Path(args.orient_anything_cache_dir)
-                if args.orient_anything_cache_dir is not None
-                else None
-            ),
-        )
-        log(f"[load] Orient Anything ready ({time.time() - t0:.1f}s)")
 
     pipeline_t0 = time.time()
     if args.compare_angle_lora:

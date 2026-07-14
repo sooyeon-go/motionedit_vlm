@@ -185,6 +185,8 @@ def run_single_pair(
             max_rotation=args.max_pre_align_rotation,
             max_attempts=args.max_prealign_verify_attempts,
             bruteforce_after_attempts=args.prealign_bruteforce_after_attempts,
+            orient_anything=orient_anything,
+            orient_confidence_threshold=args.orient_anything_confidence_threshold,
         )
         ppe.save_image(aligned_source_img, output_dir / "aligned_source.png")
         ppe.save_image(aligned_source_img, output_dir / "step_00.png")
