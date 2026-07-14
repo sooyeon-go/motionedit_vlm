@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Test the pre-align module's ability to recover a known random flip/rotation on DAVIS.
 
-Experiment (per DAVIS sequence, per stride S):
-  1. source = frame_0 (always the first frame).
-     target = the last frame reachable by hopping with stride S from frame_0
-     (indices 0, S, 2S, ... → last of those; not merely frame_S).
+Experiment (one job per DAVIS sequence by default):
+  1. source = first frame (frame_0).
+     target = last frame (frame_{N-1}).
      Real video frames of the same object are assumed to be roughly orientation-aligned,
      so the "correct" pre-align of a perturbed source is to undo the perturbation.
   2. Apply a RANDOM coarse D4 transform (horizontal/vertical flip x {0,90,180,270}
      rotation, excluding identity) to the source. The applied perturbation is recorded.
-  3. Run the existing pre-align pipeline (pre_align_source_until_verified, i.e. landmark
-     -> VLM verify -> bruteforce fallback, optionally Orient Anything) to align the
-     perturbed source toward the target.
+  3. Run pre_align_source_until_verified (Orient Anything angle table → VLM select →
+     image verify → visual D4 bruteforce fallback) to align the perturbed source
+     toward the target.
   4. Check whether the pipeline recovered the original orientation. Recovery is judged
      objectively in the D4 group via a 2x2 color fingerprint: composing the perturbation
      with the transform the pipeline applied must return to identity.
@@ -107,16 +106,16 @@ def list_frames(sequence_dir: Path) -> list[Path]:
 def target_index(num_frames: int, stride: int, target_mode: str) -> int:
     """Pick target frame index for (source=frame_0, target=...).
 
-    last_strided (default): last index reachable by hopping 0, S, 2S, ...
+    last (default): always the true final frame N-1 (first↔last comparison).
+    last_strided: last index reachable by hopping 0, S, 2S, ...
         i.e. floor((N-1)/S)*S. Differs by stride; equals true last when S=1.
-    last: always the true final frame N-1 (stride-independent).
     stride: only frame_S (early short gap; kept for ablations).
     """
     last = num_frames - 1
-    if target_mode == "last_strided":
-        return (last // stride) * stride
     if target_mode == "last":
         return last
+    if target_mode == "last_strided":
+        return (last // stride) * stride
     if target_mode == "stride":
         return min(stride, last)
     raise ValueError(f"Unknown target_mode: {target_mode}")
@@ -735,7 +734,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Test pre-align recovery of a known random flip/rotation on DAVIS "
-            "(source=frame_0, target=last frame reachable at stride S), "
+            "(source=first frame, target=last frame), "
             "with optional multi-GPU sharding."
         ),
     )
@@ -743,16 +742,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output_path", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--planner_vlm", default=str(PLANNER_VLM_MODEL))
     parser.add_argument("--vlm_device_map", default="cuda:0")
-    parser.add_argument("--strides", default="1,2,4,8,16")
+    parser.add_argument(
+        "--strides",
+        default="1",
+        help="Kept for summary keys / ablations. Default 1 (one job per sequence with first↔last).",
+    )
     parser.add_argument("--sequences", default=None, help="Comma-separated names. Default: ALL.")
     parser.add_argument(
         "--target_mode",
-        choices=("last_strided", "last", "stride"),
-        default="last_strided",
+        choices=("last", "last_strided", "stride"),
+        default="last",
         help=(
-            "Target frame. Default 'last_strided'=last frame reachable by hopping "
-            "with stride S from frame_0 (0,S,2S,...). "
-            "'last'=true final frame. 'stride'=only frame_S (ablation)."
+            "Target frame. Default 'last'=true final frame (first↔last). "
+            "'last_strided'=last frame reachable by hopping with stride S. "
+            "'stride'=only frame_S (ablation)."
         ),
     )
     parser.add_argument("--perturb_seed", type=int, default=0)
