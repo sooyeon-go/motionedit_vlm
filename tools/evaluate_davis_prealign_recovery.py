@@ -215,19 +215,24 @@ def rate(records: list[dict[str, Any]], key: str) -> float | None:
 
 
 def record_used_grounding_dino(record: dict[str, Any]) -> bool:
-    requested_mode = str(
-        record.get("requested_prealign_mode")
-        or record.get("prealign_mode")
-        or ""
-    )
+    requested_mode = str(record.get("requested_prealign_mode") or "")
+    derived_mode = str(record.get("prealign_mode") or "")
     grounding = record.get("grounding_dino") or {}
+    sample_dir = record.get("sample_dir")
+    has_disk_artifact = False
+    if sample_dir:
+        has_disk_artifact = (
+            Path(str(sample_dir)) / "prealign_grounding_dino" / "grounding_dino_result.json"
+        ).is_file()
     return (
         mode_uses_grounding_dino(requested_mode)
+        or mode_uses_grounding_dino(derived_mode)
         or grounding.get("enabled") is True
         or record.get("grounding_crop_success") is not None
         or grounding.get("success") is not None
         or grounding.get("source_detection") is not None
         or grounding.get("target_detection") is not None
+        or has_disk_artifact
     )
 
 
@@ -261,25 +266,57 @@ def grounding_detection_success_rate(
     return round(sum(1 for value in values if value) / len(values), 4)
 
 
+def load_grounding_result_from_sample_dir(record: dict[str, Any]) -> dict[str, Any]:
+    """Fallback: read saved Grounding DINO debug JSON from the sample folder."""
+    sample_dir = record.get("sample_dir")
+    if not sample_dir:
+        return {}
+    result_path = Path(sample_dir) / "prealign_grounding_dino" / "grounding_dino_result.json"
+    if not result_path.is_file():
+        return {}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def backfill_grounding_detection_success(
     record: dict[str, Any],
     *,
     default_prealign_mode: str | None = None,
 ) -> None:
     """Populate per-side grounding success keys for older jsonl records."""
-    if (
-        record.get("grounding_source_detection_success") is not None
-        and record.get("grounding_target_detection_success") is not None
-    ):
-        return
-
     if default_prealign_mode and not record.get("requested_prealign_mode"):
         record["requested_prealign_mode"] = default_prealign_mode
 
-    if not record_used_grounding_dino(record):
+    grounding = record.get("grounding_dino")
+    if not isinstance(grounding, dict):
+        grounding = {}
+    disk_grounding = load_grounding_result_from_sample_dir(record)
+    if disk_grounding:
+        # Prefer disk artifact when jsonl only has a thin/empty grounding stub.
+        merged = dict(disk_grounding)
+        merged.update({k: v for k, v in grounding.items() if v is not None})
+        grounding = merged
+        record["grounding_dino"] = {
+            "enabled": True,
+            "success": grounding.get("success"),
+            "source_detection": grounding.get("source_detection"),
+            "target_detection": grounding.get("target_detection"),
+        }
+
+    if not record_used_grounding_dino(record) and not mode_uses_grounding_dino(
+        str(default_prealign_mode or "")
+    ):
         return
 
-    grounding = record.get("grounding_dino") or {}
+    if mode_uses_grounding_dino(str(record.get("requested_prealign_mode") or default_prealign_mode or "")):
+        record.setdefault("requested_prealign_mode", default_prealign_mode)
+
+    if record.get("grounding_crop_success") is None and grounding.get("success") is not None:
+        record["grounding_crop_success"] = bool(grounding.get("success"))
+
     if record.get("grounding_source_detection_success") is None:
         record["grounding_source_detection_success"] = (
             grounding.get("source_detection") is not None
@@ -473,20 +510,14 @@ def evaluate_sample(
     grounding_result = parsed.get("grounding_dino") or {}
     grounding_source_detection_success = None
     grounding_target_detection_success = None
-    if record_used_grounding_dino(
-        {
-            "requested_prealign_mode": prealign_mode,
-            "grounding_dino": {
-                "enabled": grounding_dino is not None,
-                "success": grounding_result.get("success"),
-                "source_detection": grounding_result.get("source_detection"),
-                "target_detection": grounding_result.get("target_detection"),
-            },
-            "grounding_crop_success": grounding_result.get("success"),
-        }
-    ):
+    grounding_crop_success = grounding_result.get("success")
+    if mode_uses_grounding_dino(prealign_mode):
         grounding_source_detection_success = grounding_result.get("source_detection") is not None
         grounding_target_detection_success = grounding_result.get("target_detection") is not None
+        if grounding_crop_success is None:
+            grounding_crop_success = (
+                grounding_source_detection_success and grounding_target_detection_success
+            )
     oa_result = (
         parsed
         if parsed.get("mode") == "orient_anything_pre_align"
@@ -569,13 +600,13 @@ def evaluate_sample(
         "object_prompt": sequence,
         "grounding_dino": {
             "enabled": grounding_dino is not None,
-            "success": grounding_result.get("success"),
+            "success": grounding_crop_success,
             "source_detection": grounding_result.get("source_detection"),
             "target_detection": grounding_result.get("target_detection"),
         },
         "grounding_source_detection_success": grounding_source_detection_success,
         "grounding_target_detection_success": grounding_target_detection_success,
-        "grounding_crop_success": grounding_result.get("success"),
+        "grounding_crop_success": grounding_crop_success,
         "oa_measurement_mode": oa_result.get("measurement_mode"),
         "confidence": round(float(decision.confidence), 4),
         "verify": {

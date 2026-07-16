@@ -10,6 +10,7 @@ set -euo pipefail
 #   FRAMES_ROOT=/path/to/DAVIS/JPEGImages/Full-Resolution \
 #   GPUS=0,1,2,3,4,5,6,7 \
 #   OUTPUT_ROOT=outputs/output_comparison \
+#   GROUNDING_DINO_MODEL=/data/shared-vilab/pretrained_models/grounding-dino-base \
 #   bash run_prealign_mode_comparison.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,8 @@ PERTURB_SEED="${PERTURB_SEED:-0}"
 ORIENT_ANYTHING_REPO="${ORIENT_ANYTHING_REPO:-${REPO_ROOT}/third_party/Orient-Anything}"
 ORIENT_ANYTHING_CACHE_DIR="${ORIENT_ANYTHING_CACHE_DIR:-}"
 GROUNDING_DINO_CACHE_DIR="${GROUNDING_DINO_CACHE_DIR:-}"
+GROUNDING_DINO_MODEL="${GROUNDING_DINO_MODEL:-/data/shared-vilab/pretrained_models/grounding-dino-base}"
+GROUNDING_DINO_REPO="${GROUNDING_DINO_REPO:-IDEA-Research/grounding-dino-base}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 MODES=(
@@ -37,6 +40,14 @@ echo "[compare] frames_root=${FRAMES_ROOT}"
 echo "[compare] output_root=${OUTPUT_ROOT}"
 echo "[compare] gpus=${GPUS}"
 echo "[compare] modes=${MODES[*]}"
+echo "[compare] grounding_dino_model=${GROUNDING_DINO_MODEL}"
+
+if [[ ! -f "${GROUNDING_DINO_MODEL}/config.json" ]]; then
+  echo "[compare] Grounding DINO Base not found; downloading once."
+  "${PYTHON_BIN}" tools/download_grounding_dino.py \
+    --repo_id "${GROUNDING_DINO_REPO}" \
+    --output_dir "${GROUNDING_DINO_MODEL}"
+fi
 
 for mode in "${MODES[@]}"; do
   mode_dir="${OUTPUT_ROOT}/${mode}"
@@ -51,6 +62,7 @@ for mode in "${MODES[@]}"; do
     --prealign_mode "${mode}"
     --perturb_seed "${PERTURB_SEED}"
     --orient_anything_repo "${ORIENT_ANYTHING_REPO}"
+    --grounding_dino_model "${GROUNDING_DINO_MODEL}"
   )
 
   if [[ -n "${ORIENT_ANYTHING_CACHE_DIR}" ]]; then

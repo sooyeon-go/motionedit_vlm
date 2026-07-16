@@ -8,6 +8,8 @@ MOTIONEDIT_VLM_DIR = SHARED_PRETRAINED_ROOT / "motionedit_vlm"
 # Already present on shared storage; not downloaded by tools/download_progressive_pose_models.py
 EDITOR_BASE_MODEL = SHARED_PRETRAINED_ROOT / "Qwen-Image-Edit-2511"
 PLANNER_VLM_MODEL = SHARED_PRETRAINED_ROOT / "Qwen3-VL-8B-Instruct"
+GROUNDING_DINO_MODEL = SHARED_PRETRAINED_ROOT / "grounding-dino-base"
+GROUNDING_DINO_REPO = "IDEA-Research/grounding-dino-base"
 
 # Downloaded into motionedit_vlm/
 MOTIONEDIT_LORA_DIR = MOTIONEDIT_VLM_DIR / "motionedit-lora"
