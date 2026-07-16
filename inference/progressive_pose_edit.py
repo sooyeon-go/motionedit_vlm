@@ -65,6 +65,8 @@ MOTIONEDIT_LORA_WEIGHT = "adapter_model_converted.safetensors"
 ANGLE_LORA_WEIGHT = QWEN_ANGLES_LORA_WEIGHT
 DEFAULT_ORIENT_ANYTHING_REPO = REPO_ROOT / "third_party" / "Orient-Anything"
 DEFAULT_ORIENT_ANYTHING_MODEL_SIZE = "large"
+DEFAULT_GROUNDING_DINO_REPO = REPO_ROOT / "third_party" / "GroundingDINO"
+DEFAULT_GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-tiny"
 
 AZIMUTH_BINS = [
     "front view",
@@ -939,6 +941,17 @@ class OrientAnythingPrediction:
 
 
 @dataclass
+class GroundingDINODetection:
+    prompt: str
+    label: str
+    score: float
+    bbox_xyxy: list[float]
+    padded_bbox_xyxy: list[int] = field(default_factory=list)
+    num_detections: int = 0
+    candidate_detections: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class Analysis:
     source_description: str
     source_deformability: str
@@ -1642,6 +1655,274 @@ def _format_degrees(value: Optional[float]) -> str:
     if value is None:
         return "unknown"
     return f"{value:.1f}°"
+
+
+class GroundingDINOClient:
+    """Text-conditioned object detector used to crop the OA object of interest."""
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_GROUNDING_DINO_MODEL,
+        device: str = "cuda",
+        cache_dir: Optional[Path] = None,
+    ) -> None:
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        self.model_id = model_id
+        self.device = torch.device(
+            device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+        )
+        self.cache_dir = cache_dir.expanduser().resolve() if cache_dir is not None else None
+        load_kwargs: dict[str, Any] = {}
+        if self.cache_dir is not None:
+            load_kwargs["cache_dir"] = str(self.cache_dir)
+        log(f"[grounding-dino] Loading {model_id} on {self.device}")
+        self.processor = AutoProcessor.from_pretrained(model_id, **load_kwargs)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            model_id,
+            **load_kwargs,
+        ).to(self.device)
+        self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @staticmethod
+    def normalize_prompt(prompt: str) -> str:
+        normalized = re.sub(r"[-_]+", " ", prompt).strip().lower()
+        return normalized if normalized.endswith(".") else f"{normalized}."
+
+    @torch.no_grad()
+    def detect(
+        self,
+        image: Image.Image,
+        prompt: str,
+        *,
+        box_threshold: float = 0.30,
+        text_threshold: float = 0.25,
+    ) -> Optional[GroundingDINODetection]:
+        normalized_prompt = self.normalize_prompt(prompt)
+        inputs = self.processor(
+            images=image.convert("RGB"),
+            text=normalized_prompt,
+            return_tensors="pt",
+        ).to(self.device)
+        outputs = self.model(**inputs)
+        results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            input_ids=inputs.input_ids,
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[(image.height, image.width)],
+        )
+        if not results:
+            return None
+        result = results[0]
+        boxes = result.get("boxes")
+        scores = result.get("scores")
+        if boxes is None or scores is None or len(boxes) == 0:
+            return None
+
+        best_index = int(torch.argmax(scores).item())
+        labels = result.get("text_labels")
+        if labels is None:
+            labels = result.get("labels")
+        if labels is None:
+            labels = []
+        label = (
+            str(labels[best_index])
+            if best_index < len(labels)
+            else normalized_prompt.rstrip(".")
+        )
+        bbox = [float(value) for value in boxes[best_index].detach().cpu().tolist()]
+        candidate_detections = []
+        for index, (candidate_box, candidate_score) in enumerate(zip(boxes, scores)):
+            candidate_label = (
+                str(labels[index])
+                if index < len(labels)
+                else normalized_prompt.rstrip(".")
+            )
+            candidate_detections.append(
+                {
+                    "label": candidate_label,
+                    "score": float(candidate_score.detach().cpu().item()),
+                    "bbox_xyxy": [
+                        float(value)
+                        for value in candidate_box.detach().cpu().tolist()
+                    ],
+                    "selected": index == best_index,
+                }
+            )
+        return GroundingDINODetection(
+            prompt=normalized_prompt,
+            label=label,
+            score=float(scores[best_index].detach().cpu().item()),
+            bbox_xyxy=bbox,
+            num_detections=len(boxes),
+            candidate_detections=candidate_detections,
+        )
+
+
+def crop_grounded_object(
+    image: Image.Image,
+    detection: GroundingDINODetection,
+    *,
+    padding_ratio: float = 0.10,
+) -> Image.Image:
+    for candidate in detection.candidate_detections:
+        if candidate.get("selected"):
+            continue
+        draw.rectangle(
+            candidate["bbox_xyxy"],
+            outline=(255, 175, 40),
+            width=2,
+        )
+    x1, y1, x2, y2 = detection.bbox_xyxy
+    box_width = max(1.0, x2 - x1)
+    box_height = max(1.0, y2 - y1)
+    pad_x = box_width * max(0.0, padding_ratio)
+    pad_y = box_height * max(0.0, padding_ratio)
+    padded = [
+        max(0, int(math.floor(x1 - pad_x))),
+        max(0, int(math.floor(y1 - pad_y))),
+        min(image.width, int(math.ceil(x2 + pad_x))),
+        min(image.height, int(math.ceil(y2 + pad_y))),
+    ]
+    if padded[2] <= padded[0] or padded[3] <= padded[1]:
+        raise ValueError(f"Invalid Grounding DINO bbox after clipping: {padded}")
+    detection.padded_bbox_xyxy = padded
+    return image.crop(tuple(padded))
+
+
+def visualize_grounding_dino_detection(
+    image: Image.Image,
+    detection: Optional[GroundingDINODetection],
+    *,
+    title: str,
+) -> Image.Image:
+    canvas = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    draw.rectangle([0, 0, canvas.width, 26], fill=(0, 0, 0))
+    draw.text((6, 7), title, fill=(255, 255, 255), font=font)
+    if detection is None:
+        draw.text((6, 34), "NO DETECTION - full-frame OA fallback", fill=(255, 70, 70), font=font)
+        return canvas
+
+    x1, y1, x2, y2 = detection.bbox_xyxy
+    draw.rectangle([x1, y1, x2, y2], outline=(255, 80, 50), width=4)
+    if detection.padded_bbox_xyxy:
+        draw.rectangle(
+            detection.padded_bbox_xyxy,
+            outline=(50, 220, 80),
+            width=4,
+        )
+    label = (
+        f"{detection.label} score={detection.score:.3f} "
+        f"detections={detection.num_detections}"
+    )
+    text_y = min(canvas.height - 18, max(28, int(y1) - 18))
+    draw.rectangle([max(0, int(x1)), text_y, min(canvas.width, int(x1) + 310), text_y + 18], fill=(0, 0, 0))
+    draw.text((max(2, int(x1) + 3), text_y + 3), label, fill=(255, 255, 255), font=font)
+    return canvas
+
+
+def prepare_grounded_oa_crops(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    grounding_dino: GroundingDINOClient,
+    object_prompt: str,
+    output_dir: Path,
+    *,
+    box_threshold: float,
+    text_threshold: float,
+    padding_ratio: float,
+) -> tuple[Optional[Image.Image], Optional[Image.Image], dict[str, Any]]:
+    """Detect the named object in source/target and save all bbox/crop diagnostics."""
+    grounding_dir = output_dir / "prealign_grounding_dino"
+    grounding_dir.mkdir(parents=True, exist_ok=True)
+    source_detection = grounding_dino.detect(
+        source_img,
+        object_prompt,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
+    )
+    target_detection = grounding_dino.detect(
+        target_img,
+        object_prompt,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
+    )
+    source_crop = (
+        crop_grounded_object(source_img, source_detection, padding_ratio=padding_ratio)
+        if source_detection is not None
+        else None
+    )
+    target_crop = (
+        crop_grounded_object(target_img, target_detection, padding_ratio=padding_ratio)
+        if target_detection is not None
+        else None
+    )
+    save_image(
+        visualize_grounding_dino_detection(
+            source_img,
+            source_detection,
+            title=f"SOURCE grounding: {GroundingDINOClient.normalize_prompt(object_prompt)}",
+        ),
+        grounding_dir / "00_source_bbox.png",
+    )
+    save_image(
+        visualize_grounding_dino_detection(
+            target_img,
+            target_detection,
+            title=f"TARGET grounding: {GroundingDINOClient.normalize_prompt(object_prompt)}",
+        ),
+        grounding_dir / "01_target_bbox.png",
+    )
+    if source_crop is not None:
+        save_image(source_crop, grounding_dir / "02_source_object_crop.png")
+    if target_crop is not None:
+        save_image(target_crop, grounding_dir / "03_target_object_crop.png")
+
+    success = source_crop is not None and target_crop is not None
+    if success:
+        save_image(
+            build_labeled_image_grid(
+                [source_crop, target_crop],
+                [
+                    f"SOURCE CROP\nprompt={object_prompt}",
+                    f"TARGET CROP\nprompt={object_prompt}",
+                ],
+                columns=2,
+                thumb_size=360,
+            ),
+            grounding_dir / "04_source_target_crop_comparison.png",
+        )
+    payload = {
+        "mode": "grounding_dino_object_crop",
+        "model_id": grounding_dino.model_id,
+        "object_prompt": object_prompt,
+        "normalized_prompt": GroundingDINOClient.normalize_prompt(object_prompt),
+        "box_threshold": box_threshold,
+        "text_threshold": text_threshold,
+        "padding_ratio": padding_ratio,
+        "success": success,
+        "source_detection": asdict(source_detection) if source_detection is not None else None,
+        "target_detection": asdict(target_detection) if target_detection is not None else None,
+        "fallback_reason": (
+            None
+            if success
+            else "Object was not detected in both source and target; OA uses full frames."
+        ),
+    }
+    (grounding_dir / "grounding_dino_result.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return (
+        source_crop if success else None,
+        target_crop if success else None,
+        payload,
+    )
 
 
 class OrientAnythingClient:
@@ -2557,6 +2838,182 @@ def _thumbnail_on_canvas(image: Image.Image, size: int) -> Image.Image:
     return canvas
 
 
+def build_labeled_image_grid(
+    images: list[Image.Image],
+    captions: list[str],
+    *,
+    columns: int = 4,
+    thumb_size: int = 256,
+    selected_indices: Optional[dict[int, tuple[int, int, int]]] = None,
+) -> Image.Image:
+    """Build a debug contact sheet with multiline captions and optional colored borders."""
+    if len(images) != len(captions):
+        raise ValueError("images and captions must have the same length")
+    if not images:
+        raise ValueError("images must not be empty")
+
+    selected_indices = selected_indices or {}
+    rows = (len(images) + columns - 1) // columns
+    caption_height = 92
+    cell_w = thumb_size
+    cell_h = thumb_size + caption_height
+    grid = Image.new("RGB", (columns * cell_w, rows * cell_h), (24, 24, 24))
+    draw = ImageDraw.Draw(grid)
+    font = ImageFont.load_default()
+
+    for index, (image, caption) in enumerate(zip(images, captions)):
+        row = index // columns
+        col = index % columns
+        x0 = col * cell_w
+        y0 = row * cell_h
+        grid.paste(_thumbnail_on_canvas(image, thumb_size), (x0, y0))
+        draw.rectangle(
+            [x0, y0 + thumb_size, x0 + cell_w - 1, y0 + cell_h - 1],
+            fill=(12, 12, 12),
+        )
+        draw.multiline_text(
+            (x0 + 6, y0 + thumb_size + 6),
+            caption,
+            fill=(255, 255, 255),
+            font=font,
+            spacing=3,
+        )
+        if index in selected_indices:
+            draw.rectangle(
+                [x0 + 2, y0 + 2, x0 + cell_w - 3, y0 + cell_h - 3],
+                outline=selected_indices[index],
+                width=5,
+            )
+    return grid
+
+
+def _draw_debug_arrow(
+    draw: ImageDraw.ImageDraw,
+    origin: tuple[float, float],
+    endpoint: tuple[float, float],
+    color: tuple[int, int, int],
+) -> None:
+    draw.line([origin, endpoint], fill=color, width=5)
+    angle = math.atan2(endpoint[1] - origin[1], endpoint[0] - origin[0])
+    arrow_size = 12.0
+    left = (
+        endpoint[0] - arrow_size * math.cos(angle - math.pi / 6),
+        endpoint[1] - arrow_size * math.sin(angle - math.pi / 6),
+    )
+    right = (
+        endpoint[0] - arrow_size * math.cos(angle + math.pi / 6),
+        endpoint[1] - arrow_size * math.sin(angle + math.pi / 6),
+    )
+    draw.polygon([endpoint, left, right], fill=color)
+
+
+def visualize_orient_anything_prediction(
+    image: Image.Image,
+    prediction: OrientAnythingPrediction,
+    *,
+    title: str,
+) -> Image.Image:
+    """Overlay OA's projected front/right/top axes for debugging.
+
+    The axes are centered for visualization only; Orient Anything does not localize
+    the object or predict the axis origin.
+    """
+    canvas = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    phi = math.radians(prediction.azimuth)
+    theta = math.radians(prediction.polar)
+    gamma = math.radians(-prediction.rotation)
+
+    projected_axes = (
+        (
+            -math.sin(phi) * math.cos(gamma)
+            - math.cos(phi) * math.sin(theta) * math.sin(gamma),
+            math.sin(phi) * math.sin(gamma)
+            - math.cos(phi) * math.sin(theta) * math.cos(gamma),
+        ),
+        (
+            -math.cos(phi) * math.cos(gamma)
+            + math.sin(phi) * math.sin(theta) * math.sin(gamma),
+            math.cos(phi) * math.sin(gamma)
+            + math.sin(phi) * math.sin(theta) * math.cos(gamma),
+        ),
+        (
+            math.cos(theta) * math.sin(gamma),
+            math.cos(theta) * math.cos(gamma),
+        ),
+    )
+    origin = (canvas.width / 2.0, canvas.height / 2.0)
+    scale = max(24.0, min(canvas.width, canvas.height) * 0.24)
+    colors = ((235, 55, 55), (55, 220, 80), (55, 130, 255))
+    labels = ("front", "right", "top")
+    for (axis_x, axis_y), color, label in zip(projected_axes, colors, labels):
+        endpoint = (origin[0] + axis_x * scale, origin[1] - axis_y * scale)
+        _draw_debug_arrow(draw, origin, endpoint, color)
+        draw.text((endpoint[0] + 4, endpoint[1] + 2), label, fill=color, font=font)
+
+    draw.ellipse(
+        [origin[0] - 5, origin[1] - 5, origin[0] + 5, origin[1] + 5],
+        fill=(255, 255, 255),
+        outline=(0, 0, 0),
+    )
+    title_height = 24
+    info_height = 42
+    draw.rectangle([0, 0, canvas.width, title_height], fill=(0, 0, 0))
+    draw.text((6, 6), title, fill=(255, 255, 255), font=font)
+    draw.rectangle(
+        [0, canvas.height - info_height, canvas.width, canvas.height],
+        fill=(0, 0, 0),
+    )
+    draw.multiline_text(
+        (6, canvas.height - info_height + 4),
+        (
+            f"az={prediction.azimuth:.1f}  polar={prediction.polar:.1f}  "
+            f"rot={prediction.rotation:.1f}\nconfidence={prediction.confidence:.4f}"
+        ),
+        fill=(255, 255, 255),
+        font=font,
+        spacing=2,
+    )
+    return canvas
+
+
+def save_prealign_verify_triptych(
+    original_source: Image.Image,
+    aligned_source: Image.Image,
+    target_img: Image.Image,
+    decision: PreAlignDecision,
+    verify: PreAlignVerifyResult,
+    path: Path,
+    *,
+    title: str,
+) -> None:
+    captions = [
+        "ORIGINAL SOURCE",
+        (
+            "SELECTED / ALIGNED\n"
+            f"flip_h={decision.applied_horizontal_flip}, "
+            f"flip_v={decision.applied_vertical_flip}\n"
+            f"rotate={decision.applied_rotation_degrees:.0f}"
+        ),
+        (
+            "TARGET\n"
+            f"verify={verify.recommendation}, ok={verify.overall_ok}"
+        ),
+    ]
+    grid = build_labeled_image_grid(
+        [original_source, aligned_source, target_img],
+        captions,
+        columns=3,
+        thumb_size=320,
+        selected_indices={1: (50, 220, 80)},
+    )
+    draw = ImageDraw.Draw(grid)
+    draw.rectangle([0, 0, grid.width, 24], fill=(0, 0, 0))
+    draw.text((6, 6), title, fill=(255, 255, 255), font=ImageFont.load_default())
+    save_image(grid, path)
+
+
 def build_coarse_candidate_grid(
     candidates: list[Image.Image],
     transforms: list[CoarseOrientationTransform],
@@ -2652,6 +3109,8 @@ def orient_anything_pre_align_source(
     planner_vlm: QwenVLMClient,
     output_dir: Path,
     confidence_threshold: float,
+    source_oa_img: Optional[Image.Image] = None,
+    target_oa_img: Optional[Image.Image] = None,
 ) -> Optional[tuple[Image.Image, PreAlignDecision, dict[str, Any]]]:
     """Measure OA angles on 8 candidates + TARGET, then let VLM pick the closest transform.
 
@@ -2664,13 +3123,40 @@ def orient_anything_pre_align_source(
         log("[prealign:oa] No coarse orientation candidates generated.")
         return None
 
-    target_prediction = orient_anything.predict(target_img)
+    oa_dir = output_dir / "prealign_orient_anything"
+    oa_dir.mkdir(parents=True, exist_ok=True)
+    save_image(source_img, oa_dir / "00_input_source.png")
+    save_image(target_img, oa_dir / "01_target.png")
+
+    source_measurement_img = source_oa_img or source_img
+    target_measurement_img = target_oa_img or target_img
+    measurement_mode = (
+        "grounding_dino_object_crop"
+        if source_oa_img is not None and target_oa_img is not None
+        else "full_frame"
+    )
+    save_image(source_measurement_img, oa_dir / "00b_source_oa_input.png")
+    save_image(target_measurement_img, oa_dir / "01b_target_oa_input.png")
+
+    target_prediction = orient_anything.predict(target_measurement_img)
+    target_overlay = visualize_orient_anything_prediction(
+        target_measurement_img,
+        target_prediction,
+        title=f"TARGET OA prediction - {measurement_mode}",
+    )
+    save_image(target_overlay, oa_dir / "02_target_orientation_overlay.png")
+
     candidates_by_id: dict[int, Image.Image] = {}
+    candidate_overlays_by_id: dict[int, Image.Image] = {}
     candidate_records: list[dict[str, Any]] = []
 
     for transform in transforms:
         candidate = apply_coarse_orientation_transform(source_img, transform)
-        prediction = orient_anything.predict(candidate)
+        candidate_oa_img = apply_coarse_orientation_transform(
+            source_measurement_img,
+            transform,
+        )
+        prediction = orient_anything.predict(candidate_oa_img)
         deltas = _orient_candidate_deltas(prediction, target_prediction)
         confidence_ok = (
             prediction.confidence >= confidence_threshold
@@ -2687,9 +3173,27 @@ def orient_anything_pre_align_source(
         }
         candidate_records.append(record)
         candidates_by_id[transform.candidate_id] = candidate
-
-    oa_dir = output_dir / "prealign_orient_anything"
-    oa_dir.mkdir(parents=True, exist_ok=True)
+        candidate_overlay = visualize_orient_anything_prediction(
+            candidate_oa_img,
+            prediction,
+            title=(
+                f"CANDIDATE {transform.candidate_id} OA input - "
+                f"{measurement_mode} - {transform.label}"
+            ),
+        )
+        candidate_overlays_by_id[transform.candidate_id] = candidate_overlay
+        save_image(
+            candidate,
+            oa_dir / f"candidate_{transform.candidate_id:02d}_raw.png",
+        )
+        save_image(
+            candidate_oa_img,
+            oa_dir / f"candidate_{transform.candidate_id:02d}_oa_input.png",
+        )
+        save_image(
+            candidate_overlay,
+            oa_dir / f"candidate_{transform.candidate_id:02d}_orientation_overlay.png",
+        )
 
     max_candidate_id = len(transforms) - 1
     messages = [
@@ -2721,6 +3225,54 @@ def orient_anything_pre_align_source(
     if alternative_id == best_id:
         alternative_id = None
 
+    ordered_candidates = [candidates_by_id[transform.candidate_id] for transform in transforms]
+    ordered_overlays = [
+        candidate_overlays_by_id[transform.candidate_id] for transform in transforms
+    ]
+    raw_captions = [
+        (
+            f"id={transform.candidate_id}  flip_h={transform.flip_horizontal} "
+            f"flip_v={transform.flip_vertical}\nrotate={transform.rotation_degrees}"
+        )
+        for transform in transforms
+    ]
+    orientation_captions = []
+    for record in candidate_records:
+        prediction = record["prediction"]
+        deltas = record["deltas"]
+        orientation_captions.append(
+            (
+                f"id={record['candidate_id']}  az={prediction['azimuth']:.1f} "
+                f"polar={prediction['polar']:.1f} rot={prediction['rotation']:.1f}\n"
+                f"delta={deltas['azimuth_delta']:.1f}/"
+                f"{deltas['polar_delta']:.1f}/{deltas['rotation_delta']:.1f} "
+                f"conf={prediction['confidence']:.4f}"
+            )
+        )
+    highlights: dict[int, tuple[int, int, int]] = {}
+    if best_id is not None:
+        highlights[best_id] = (50, 220, 80)
+    if alternative_id is not None:
+        highlights[alternative_id] = (255, 190, 40)
+    save_image(
+        build_labeled_image_grid(
+            ordered_candidates,
+            raw_captions,
+            columns=4,
+            selected_indices=highlights,
+        ),
+        oa_dir / "03_all_candidates_raw_grid.png",
+    )
+    save_image(
+        build_labeled_image_grid(
+            ordered_overlays,
+            orientation_captions,
+            columns=4,
+            selected_indices=highlights,
+        ),
+        oa_dir / "04_all_candidates_orientation_grid.png",
+    )
+
     if not can_select or best_id is None:
         payload: dict[str, Any] = {
             "mode": "orient_anything_pre_align",
@@ -2729,6 +3281,7 @@ def orient_anything_pre_align_source(
             "num_candidates": len(transforms),
             "confidence_threshold": confidence_threshold,
             "confidence_gate": False,
+            "measurement_mode": measurement_mode,
             "target_prediction": asdict(target_prediction),
             "candidate_records": candidate_records,
             "vlm_response": vlm_response,
@@ -2756,6 +3309,26 @@ def orient_anything_pre_align_source(
 
     chosen_path = oa_dir / "selected_candidate.png"
     save_image(best_aligned, chosen_path)
+    selection_images = [
+        source_img,
+        target_overlay,
+        candidate_overlays_by_id[best_id],
+    ]
+    selection_captions = [
+        "INPUT SOURCE",
+        "TARGET + OA AXES",
+        f"VLM SELECTED id={best_id}\n{chosen_transform.label}",
+    ]
+    save_image(
+        build_labeled_image_grid(
+            selection_images,
+            selection_captions,
+            columns=3,
+            thumb_size=320,
+            selected_indices={2: (50, 220, 80)},
+        ),
+        oa_dir / "05_oa_vlm_selection_comparison.png",
+    )
     confidence = min(
         float(best_record["prediction"]["confidence"]),
         float(target_prediction.confidence),
@@ -2780,6 +3353,7 @@ def orient_anything_pre_align_source(
         "num_candidates": len(transforms),
         "confidence_threshold": confidence_threshold,
         "confidence_gate": False,
+        "measurement_mode": measurement_mode,
         "target_prediction": asdict(target_prediction),
         "candidate_records": candidate_records,
         "vlm_response": vlm_response,
@@ -2826,6 +3400,8 @@ def bruteforce_pre_align_source(
 
     bruteforce_dir = output_dir / "prealign_bruteforce"
     bruteforce_dir.mkdir(parents=True, exist_ok=True)
+    save_image(source_img, bruteforce_dir / "00_input_source.png")
+    save_image(target_img, bruteforce_dir / "01_target.png")
 
     candidates: list[Image.Image] = []
     candidate_records: list[dict[str, Any]] = []
@@ -2884,6 +3460,29 @@ def bruteforce_pre_align_source(
     if alternative_id == best_id:
         alternative_id = None
 
+    visual_highlights: dict[int, tuple[int, int, int]] = {}
+    if best_id is not None:
+        visual_highlights[best_id] = (50, 220, 80)
+    if alternative_id is not None:
+        visual_highlights[alternative_id] = (255, 190, 40)
+    detailed_captions = [
+        (
+            f"id={transform.candidate_id}  flip_h={transform.flip_horizontal} "
+            f"flip_v={transform.flip_vertical}\n"
+            f"rotate={transform.rotation_degrees}"
+        )
+        for transform in transforms
+    ]
+    save_image(
+        build_labeled_image_grid(
+            candidates,
+            detailed_captions,
+            columns=grid_columns,
+            selected_indices=visual_highlights,
+        ),
+        bruteforce_dir / "02_visual_candidate_debug_grid.png",
+    )
+
     if not can_select or best_id is None:
         payload = {
             "mode": "bruteforce_fallback",
@@ -2912,6 +3511,20 @@ def bruteforce_pre_align_source(
         transform for transform in transforms if transform.candidate_id == best_id
     )
     aligned = candidates[best_id]
+    save_image(
+        build_labeled_image_grid(
+            [source_img, target_img, aligned],
+            [
+                "INPUT SOURCE",
+                "TARGET",
+                f"VLM SELECTED id={best_id}\n{chosen_transform.label}",
+            ],
+            columns=3,
+            thumb_size=320,
+            selected_indices={2: (50, 220, 80)},
+        ),
+        bruteforce_dir / "03_visual_vlm_selection_comparison.png",
+    )
 
     decision = PreAlignDecision(
         should_horizontal_flip=chosen_transform.flip_horizontal,
@@ -3070,16 +3683,63 @@ def pre_align_source_until_verified(
     bruteforce_after_attempts: int = 5,
     orient_anything: Optional[OrientAnythingClient] = None,
     orient_confidence_threshold: float = 0.5,
+    grounding_dino: Optional[GroundingDINOClient] = None,
+    object_prompt: Optional[str] = None,
+    grounding_box_threshold: float = 0.30,
+    grounding_text_threshold: float = 0.25,
+    grounding_crop_padding: float = 0.10,
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
     # Kept in the signature for compatibility with existing callers. The A→C
     # pipeline no longer performs landmark retries.
     del min_confidence, max_rotation, max_attempts, bruteforce_after_attempts
 
     oa_payload: Optional[dict[str, Any]] = None
+    grounding_payload: Optional[dict[str, Any]] = None
+    source_oa_img: Optional[Image.Image] = None
+    target_oa_img: Optional[Image.Image] = None
     fallback_reason = (
         "Orient Anything is disabled; run visual candidate selection directly."
     )
     if orient_anything is not None:
+        if grounding_dino is not None and object_prompt:
+            try:
+                source_oa_img, target_oa_img, grounding_payload = prepare_grounded_oa_crops(
+                    source_img,
+                    target_img,
+                    grounding_dino,
+                    object_prompt,
+                    output_dir,
+                    box_threshold=grounding_box_threshold,
+                    text_threshold=grounding_text_threshold,
+                    padding_ratio=grounding_crop_padding,
+                )
+                if source_oa_img is not None and target_oa_img is not None:
+                    log(
+                        "[prealign:grounding-dino] Object crops ready for OA: "
+                        f"prompt={object_prompt!r}"
+                    )
+                else:
+                    log(
+                        "[prealign:grounding-dino] Detection incomplete; OA uses full frames."
+                    )
+            except Exception as exc:
+                source_oa_img = None
+                target_oa_img = None
+                grounding_payload = {
+                    "mode": "grounding_dino_object_crop",
+                    "object_prompt": object_prompt,
+                    "success": False,
+                    "error": str(exc),
+                    "fallback_reason": "Grounding DINO failed; OA uses full frames.",
+                }
+                grounding_dir = output_dir / "prealign_grounding_dino"
+                grounding_dir.mkdir(parents=True, exist_ok=True)
+                (grounding_dir / "grounding_dino_result.json").write_text(
+                    json.dumps(grounding_payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                log(f"[prealign:grounding-dino] Failed; OA uses full frames: {exc}")
+
         try:
             oa_result = orient_anything_pre_align_source(
                 source_img=source_img,
@@ -3088,6 +3748,8 @@ def pre_align_source_until_verified(
                 planner_vlm=planner_vlm,
                 output_dir=output_dir,
                 confidence_threshold=orient_confidence_threshold,
+                source_oa_img=source_oa_img,
+                target_oa_img=target_oa_img,
             )
         except Exception as exc:
             oa_result = None
@@ -3096,7 +3758,19 @@ def pre_align_source_until_verified(
 
         if oa_result is not None:
             aligned, decision, oa_payload = oa_result
+            oa_payload["grounding_dino"] = grounding_payload
             verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
+            save_prealign_verify_triptych(
+                source_img,
+                aligned,
+                target_img,
+                decision,
+                verify,
+                output_dir
+                / "prealign_orient_anything"
+                / "06_oa_selection_verify_triptych.png",
+                title="OA-angle VLM selection - image verification",
+            )
             oa_payload["verify"] = asdict(verify)
             oa_payload["phase"] = "orient_anything_pre_align"
             (output_dir / "pre_alignment.json").write_text(
@@ -3141,6 +3815,7 @@ def pre_align_source_until_verified(
             "mode": "a_to_c_pre_align",
             "phase": "rolled_back",
             "orient_anything": oa_payload,
+            "grounding_dino": grounding_payload,
             "fallback_reason": fallback_reason,
             "bruteforce_fallback": None,
             "rolled_back": True,
@@ -3154,13 +3829,24 @@ def pre_align_source_until_verified(
 
     aligned, decision, bruteforce_payload = bruteforce_result
     verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
+    save_prealign_verify_triptych(
+        source_img,
+        aligned,
+        target_img,
+        decision,
+        verify,
+        output_dir / "prealign_bruteforce" / "04_primary_verify_triptych.png",
+        title="Visual D4 primary candidate - image verification",
+    )
     bruteforce_payload["verify"] = asdict(verify)
     parsed = {
         "mode": "a_to_c_pre_align",
         "phase": "bruteforce_fallback",
         "orient_anything": oa_payload,
+        "grounding_dino": grounding_payload,
         "fallback_reason": fallback_reason,
         "bruteforce_fallback": bruteforce_payload,
+        "primary_verify": asdict(verify),
         "verify": asdict(verify),
     }
     if verify.overall_ok and verify.recommendation == "apply":
@@ -3199,6 +3885,15 @@ def pre_align_source_until_verified(
             alternative_decision,
             planner_vlm,
         )
+        save_prealign_verify_triptych(
+            source_img,
+            alternative_aligned,
+            target_img,
+            alternative_decision,
+            alternative_verify,
+            output_dir / "prealign_bruteforce" / "05_alternative_verify_triptych.png",
+            title="Visual D4 alternative candidate - image verification",
+        )
         parsed["alternative_attempt"] = {
             "candidate_id": alternative_id,
             "chosen_transform": asdict(alternative_transform),
@@ -3207,6 +3902,7 @@ def pre_align_source_until_verified(
         }
         if alternative_verify.overall_ok and alternative_verify.recommendation == "apply":
             log("[prealign:bruteforce] Alternative verify PASSED; applying alternative candidate.")
+            parsed["verify"] = asdict(alternative_verify)
             (output_dir / "pre_alignment.json").write_text(
                 json.dumps(parsed, indent=2, ensure_ascii=False),
                 encoding="utf-8",

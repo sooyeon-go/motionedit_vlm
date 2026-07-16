@@ -10,7 +10,8 @@ Experiment (one job per DAVIS sequence by default):
      rotation, excluding identity) to the source. The applied perturbation is recorded.
   3. Run pre_align_source_until_verified (Orient Anything angle table → VLM select →
      image verify → visual D4 bruteforce fallback) to align the perturbed source
-     toward the target.
+     toward the target. When OA is enabled, Grounding DINO uses the DAVIS sequence
+     folder name as its text prompt and supplies object crops to OA.
   4. Check whether the pipeline recovered the original orientation. Recovery is judged
      objectively in the D4 group via a 2x2 color fingerprint: composing the perturbation
      with the transform the pipeline applied must return to identity.
@@ -215,6 +216,7 @@ def rate(records: list[dict[str, Any]], key: str) -> float | None:
 
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     mode_counts: dict[str, int] = {}
+    oa_measurement_mode_counts: dict[str, int] = {}
     recovered_sequences: list[str] = []
     failed_sequences: list[str] = []
     seen_recovered: set[str] = set()
@@ -222,6 +224,10 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in records:
         mode = str(record.get("prealign_mode", "unknown"))
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        oa_measurement_mode = record.get("oa_measurement_mode")
+        if oa_measurement_mode:
+            key = str(oa_measurement_mode)
+            oa_measurement_mode_counts[key] = oa_measurement_mode_counts.get(key, 0) + 1
         sequence = str(record.get("sequence", "unknown"))
         if record.get("recovered") is True:
             if sequence not in seen_recovered:
@@ -237,7 +243,9 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "num_samples": len(records),
         "recovery_rate": rate(records, "recovered"),
         "verify_apply_rate": rate(records, "verify_apply"),
+        "grounding_crop_success_rate": rate(records, "grounding_crop_success"),
         "mode_counts": mode_counts,
+        "oa_measurement_mode_counts": oa_measurement_mode_counts,
         "recovered_sequences": recovered_sequences,
         "failed_sequences": failed_sequences,
         "num_recovered_sequences": len(recovered_sequences),
@@ -275,6 +283,10 @@ def evaluate_sample(
     perturb_seed: int,
     orient_anything: Any | None,
     orient_confidence_threshold: float,
+    grounding_dino: Any | None,
+    grounding_box_threshold: float,
+    grounding_text_threshold: float,
+    grounding_crop_padding: float,
     save_images: bool,
 ) -> dict[str, Any]:
     sequence = job["sequence"]
@@ -327,6 +339,11 @@ def evaluate_sample(
         bruteforce_after_attempts=prealign_bruteforce_after_attempts,
         orient_anything=orient_anything,
         orient_confidence_threshold=orient_confidence_threshold,
+        grounding_dino=grounding_dino,
+        object_prompt=sequence,
+        grounding_box_threshold=grounding_box_threshold,
+        grounding_text_threshold=grounding_text_threshold,
+        grounding_crop_padding=grounding_crop_padding,
     )
 
     recovered = is_orientation_recovered(
@@ -337,12 +354,64 @@ def evaluate_sample(
     )
     verify = parsed.get("verify") or {}
     verify_apply = bool(verify.get("overall_ok")) and str(verify.get("recommendation", "")).lower() == "apply"
+    grounding_result = parsed.get("grounding_dino") or {}
+    oa_result = (
+        parsed
+        if parsed.get("mode") == "orient_anything_pre_align"
+        else (parsed.get("orient_anything") or {})
+    )
 
     if save_images:
         source_img.save(sample_dir / "source_frame0.png")
         perturbed_source.save(sample_dir / "perturbed_source.png")
         aligned.save(sample_dir / "aligned.png")
         target_img.save(sample_dir / "target.png")
+        overview = ppe.build_labeled_image_grid(
+            [source_img, perturbed_source, target_img, aligned],
+            [
+                "ORIGINAL frame_0\n(expected orientation)",
+                (
+                    "PERTURBED SOURCE\n"
+                    f"flip_h={flip_h}, flip_v={flip_v}, rotate={rot}"
+                ),
+                f"TARGET\n{target_path.name}",
+                (
+                    "FINAL PRE-ALIGN OUTPUT\n"
+                    f"mode={derive_prealign_mode(parsed)}, recovered={recovered}"
+                ),
+            ],
+            columns=2,
+            thumb_size=360,
+            selected_indices={3: (50, 220, 80) if recovered else (235, 55, 55)},
+        )
+        overview.save(sample_dir / "debug_recovery_overview.png")
+        debug_manifest = {
+            "debug_recovery_overview.png": (
+                "Original frame_0, synthetic perturbation, target, and final pre-align output."
+            ),
+            "source_frame0.png": "Unperturbed first DAVIS frame; recovery ground truth.",
+            "perturbed_source.png": "First frame after the sampled D4 perturbation.",
+            "target.png": "Last DAVIS frame used as the pre-align geometry reference.",
+            "aligned.png": "Final output returned by the A-to-C pre-align pipeline.",
+            "prealign_orient_anything/": (
+                "OA target/candidate predictions, axis overlays, candidate grids, selection, "
+                "and image verification."
+            ),
+            "prealign_grounding_dino/": (
+                "Folder-name text grounding boxes, padded boxes, source/target object crops, "
+                "and detection metadata."
+            ),
+            "prealign_bruteforce/": (
+                "Visual D4 candidate images/grid, VLM selection, primary verify, and optional "
+                "alternative verify."
+            ),
+            "pre_alignment.json": "Complete A-to-C decisions and verification records.",
+            "perturbation.json": "Known random D4 perturbation applied in this experiment.",
+        }
+        (sample_dir / "debug_visualizations.json").write_text(
+            json.dumps(debug_manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     return {
         "sequence": sequence,
@@ -364,6 +433,15 @@ def evaluate_sample(
         ),
         "recovered": recovered,
         "prealign_mode": derive_prealign_mode(parsed),
+        "object_prompt": sequence,
+        "grounding_dino": {
+            "enabled": grounding_dino is not None,
+            "success": grounding_result.get("success"),
+            "source_detection": grounding_result.get("source_detection"),
+            "target_detection": grounding_result.get("target_detection"),
+        },
+        "grounding_crop_success": grounding_result.get("success"),
+        "oa_measurement_mode": oa_result.get("measurement_mode"),
         "confidence": round(float(decision.confidence), 4),
         "verify": {
             "overall_ok": verify.get("overall_ok"),
@@ -424,6 +502,28 @@ def maybe_build_orient_anything(args: argparse.Namespace) -> Any | None:
     )
 
 
+def maybe_build_grounding_dino(args: argparse.Namespace) -> Any | None:
+    if not args.use_orient_anything or args.disable_grounding_dino:
+        return None
+    try:
+        return ppe.GroundingDINOClient(
+            model_id=args.grounding_dino_model,
+            device="cuda",
+            cache_dir=(
+                Path(args.grounding_dino_cache_dir)
+                if args.grounding_dino_cache_dir
+                else None
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "[prealign-eval] Grounding DINO load failed; continuing with full-frame OA: "
+            f"{exc}",
+            flush=True,
+        )
+        return None
+
+
 def run_worker(
     jobs: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -445,6 +545,7 @@ def run_worker(
         torch_dtype="auto",
     )
     orient_anything = maybe_build_orient_anything(args)
+    grounding_dino = maybe_build_grounding_dino(args)
 
     records: list[dict[str, Any]] = []
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +569,10 @@ def run_worker(
                     perturb_seed=args.perturb_seed,
                     orient_anything=orient_anything,
                     orient_confidence_threshold=args.orient_anything_confidence_threshold,
+                    grounding_dino=grounding_dino,
+                    grounding_box_threshold=args.grounding_box_threshold,
+                    grounding_text_threshold=args.grounding_text_threshold,
+                    grounding_crop_padding=args.grounding_crop_padding,
                     save_images=not args.no_save_images,
                 )
                 record["status"] = "ok"
@@ -586,6 +691,13 @@ def write_summary(
         "perturb_seed": args.perturb_seed,
         "planner_vlm": str(args.planner_vlm),
         "use_orient_anything": args.use_orient_anything,
+        "use_grounding_dino": (
+            args.use_orient_anything and not args.disable_grounding_dino
+        ),
+        "grounding_dino_model": args.grounding_dino_model,
+        "grounding_box_threshold": args.grounding_box_threshold,
+        "grounding_text_threshold": args.grounding_text_threshold,
+        "grounding_crop_padding": args.grounding_crop_padding,
         "pre_align_min_confidence": args.pre_align_min_confidence,
         "max_pre_align_rotation": args.max_pre_align_rotation,
         "gpu_ids": gpu_ids,
@@ -672,6 +784,10 @@ def launch_multi_gpu(args: argparse.Namespace, jobs: list[dict[str, Any]], gpu_i
             "--max_prealign_verify_attempts", str(args.max_prealign_verify_attempts),
             "--prealign_bruteforce_after_attempts", str(args.prealign_bruteforce_after_attempts),
             "--orient_anything_confidence_threshold", str(args.orient_anything_confidence_threshold),
+            "--grounding_dino_model", str(args.grounding_dino_model),
+            "--grounding_box_threshold", str(args.grounding_box_threshold),
+            "--grounding_text_threshold", str(args.grounding_text_threshold),
+            "--grounding_crop_padding", str(args.grounding_crop_padding),
             "--jsonl_path", str(shard_path),
             "--worker_id", str(worker_id),
             "--num_workers", str(num_workers),
@@ -692,6 +808,12 @@ def launch_multi_gpu(args: argparse.Namespace, jobs: list[dict[str, Any]], gpu_i
                 cmd.extend(["--orient_anything_ckpt", str(args.orient_anything_ckpt)])
             if args.orient_anything_cache_dir:
                 cmd.extend(["--orient_anything_cache_dir", str(args.orient_anything_cache_dir)])
+            if args.disable_grounding_dino:
+                cmd.append("--disable_grounding_dino")
+            if args.grounding_dino_cache_dir:
+                cmd.extend(
+                    ["--grounding_dino_cache_dir", str(args.grounding_dino_cache_dir)]
+                )
         print(f"[prealign-eval] start worker {worker_id} on GPU {gpu_id}", flush=True)
         procs.append(subprocess.Popen(cmd, env=env))
 
@@ -788,6 +910,22 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--orient_anything_confidence_threshold", type=float, default=0.50)
     parser.add_argument("--orient_anything_cache_dir", default=None)
+    parser.add_argument(
+        "--disable_grounding_dino",
+        action="store_true",
+        help=(
+            "Disable folder-name Grounding DINO crops. By default, --use_orient_anything "
+            "detects the sequence-named object before OA."
+        ),
+    )
+    parser.add_argument(
+        "--grounding_dino_model",
+        default=ppe.DEFAULT_GROUNDING_DINO_MODEL,
+    )
+    parser.add_argument("--grounding_dino_cache_dir", default=None)
+    parser.add_argument("--grounding_box_threshold", type=float, default=0.30)
+    parser.add_argument("--grounding_text_threshold", type=float, default=0.25)
+    parser.add_argument("--grounding_crop_padding", type=float, default=0.10)
 
     # Internal worker flags.
     parser.add_argument("--worker_id", type=int, default=None)
