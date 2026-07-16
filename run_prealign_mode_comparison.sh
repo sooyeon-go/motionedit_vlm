@@ -112,7 +112,10 @@ for entry in entries:
     overall = entry.get("overall") or {}
     print(
         f"  - {entry['mode']}: recovery_rate={overall.get('recovery_rate')} "
-        f"verify_apply_rate={overall.get('verify_apply_rate')}"
+        f"verify_apply_rate={overall.get('verify_apply_rate')} "
+        f"grounding_source={overall.get('grounding_source_detection_success_rate')} "
+        f"grounding_target={overall.get('grounding_target_detection_success_rate')} "
+        f"grounding_both={overall.get('grounding_crop_success_rate')}"
     )
 PY
 

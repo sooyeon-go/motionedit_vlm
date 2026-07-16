@@ -243,6 +243,12 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "num_samples": len(records),
         "recovery_rate": rate(records, "recovered"),
         "verify_apply_rate": rate(records, "verify_apply"),
+        "grounding_source_detection_success_rate": rate(
+            records, "grounding_source_detection_success"
+        ),
+        "grounding_target_detection_success_rate": rate(
+            records, "grounding_target_detection_success"
+        ),
         "grounding_crop_success_rate": rate(records, "grounding_crop_success"),
         "mode_counts": mode_counts,
         "oa_measurement_mode_counts": oa_measurement_mode_counts,
@@ -378,6 +384,11 @@ def evaluate_sample(
     verify = parsed.get("verify") or {}
     verify_apply = bool(verify.get("overall_ok")) and str(verify.get("recommendation", "")).lower() == "apply"
     grounding_result = parsed.get("grounding_dino") or {}
+    grounding_source_detection_success = None
+    grounding_target_detection_success = None
+    if mode_uses_grounding_dino(prealign_mode):
+        grounding_source_detection_success = grounding_result.get("source_detection") is not None
+        grounding_target_detection_success = grounding_result.get("target_detection") is not None
     oa_result = (
         parsed
         if parsed.get("mode") == "orient_anything_pre_align"
@@ -464,6 +475,8 @@ def evaluate_sample(
             "source_detection": grounding_result.get("source_detection"),
             "target_detection": grounding_result.get("target_detection"),
         },
+        "grounding_source_detection_success": grounding_source_detection_success,
+        "grounding_target_detection_success": grounding_target_detection_success,
         "grounding_crop_success": grounding_result.get("success"),
         "oa_measurement_mode": oa_result.get("measurement_mode"),
         "confidence": round(float(decision.confidence), 4),
@@ -632,8 +645,29 @@ def load_jsonl_records(jsonl_path: Path) -> list[dict[str, Any]]:
             line = line.strip()
             if not line:
                 continue
-            records.append(json.loads(line))
+            record = json.loads(line)
+            backfill_grounding_detection_success(record)
+            records.append(record)
     return records
+
+
+def backfill_grounding_detection_success(record: dict[str, Any]) -> None:
+    """Populate per-side grounding success keys for older jsonl records."""
+    if (
+        "grounding_source_detection_success" in record
+        and "grounding_target_detection_success" in record
+    ):
+        return
+    requested_mode = str(
+        record.get("requested_prealign_mode")
+        or record.get("prealign_mode")
+        or ""
+    )
+    if not mode_uses_grounding_dino(requested_mode):
+        return
+    grounding = record.get("grounding_dino") or {}
+    record["grounding_source_detection_success"] = grounding.get("source_detection") is not None
+    record["grounding_target_detection_success"] = grounding.get("target_detection") is not None
 
 
 def rebuild_summary_from_jsonl(
