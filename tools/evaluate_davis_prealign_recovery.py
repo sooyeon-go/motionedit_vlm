@@ -271,6 +271,27 @@ def derive_prealign_mode(parsed: dict[str, Any]) -> str:
     return "unknown"
 
 
+def resolve_prealign_mode(args: argparse.Namespace) -> str:
+    """Resolve explicit mode, retaining legacy OA flags for old commands."""
+    if args.prealign_mode is not None:
+        return args.prealign_mode
+    if args.use_orient_anything:
+        return (
+            "oa"
+            if args.disable_grounding_dino
+            else "oa_grounding_dino"
+        )
+    return "vlm"
+
+
+def mode_uses_orient_anything(mode: str) -> bool:
+    return mode in {"oa", "oa_grounding_dino"}
+
+
+def mode_uses_grounding_dino(mode: str) -> bool:
+    return mode in {"grounding_dino", "oa_grounding_dino"}
+
+
 def evaluate_sample(
     job: dict[str, Any],
     planner_vlm: ppe.QwenVLMClient,
@@ -287,6 +308,7 @@ def evaluate_sample(
     grounding_box_threshold: float,
     grounding_text_threshold: float,
     grounding_crop_padding: float,
+    prealign_mode: str,
     save_images: bool,
 ) -> dict[str, Any]:
     sequence = job["sequence"]
@@ -344,6 +366,7 @@ def evaluate_sample(
         grounding_box_threshold=grounding_box_threshold,
         grounding_text_threshold=grounding_text_threshold,
         grounding_crop_padding=grounding_crop_padding,
+        prealign_mode=prealign_mode,
     )
 
     recovered = is_orientation_recovered(
@@ -432,6 +455,7 @@ def evaluate_sample(
             float(decision.applied_rotation_degrees)
         ),
         "recovered": recovered,
+        "requested_prealign_mode": prealign_mode,
         "prealign_mode": derive_prealign_mode(parsed),
         "object_prompt": sequence,
         "grounding_dino": {
@@ -491,7 +515,7 @@ def shard_jobs(jobs: list[dict[str, Any]], worker_id: int, num_workers: int) -> 
 
 
 def maybe_build_orient_anything(args: argparse.Namespace) -> Any | None:
-    if not args.use_orient_anything:
+    if not mode_uses_orient_anything(args.prealign_mode):
         return None
     return ppe.OrientAnythingClient(
         repo_dir=Path(args.orient_anything_repo),
@@ -503,7 +527,7 @@ def maybe_build_orient_anything(args: argparse.Namespace) -> Any | None:
 
 
 def maybe_build_grounding_dino(args: argparse.Namespace) -> Any | None:
-    if not args.use_orient_anything or args.disable_grounding_dino:
+    if not mode_uses_grounding_dino(args.prealign_mode):
         return None
     try:
         return ppe.GroundingDINOClient(
@@ -573,6 +597,7 @@ def run_worker(
                     grounding_box_threshold=args.grounding_box_threshold,
                     grounding_text_threshold=args.grounding_text_threshold,
                     grounding_crop_padding=args.grounding_crop_padding,
+                    prealign_mode=args.prealign_mode,
                     save_images=not args.no_save_images,
                 )
                 record["status"] = "ok"
@@ -690,10 +715,9 @@ def write_summary(
         "target_mode": args.target_mode,
         "perturb_seed": args.perturb_seed,
         "planner_vlm": str(args.planner_vlm),
-        "use_orient_anything": args.use_orient_anything,
-        "use_grounding_dino": (
-            args.use_orient_anything and not args.disable_grounding_dino
-        ),
+        "requested_prealign_mode": args.prealign_mode,
+        "use_orient_anything": mode_uses_orient_anything(args.prealign_mode),
+        "use_grounding_dino": mode_uses_grounding_dino(args.prealign_mode),
         "grounding_dino_model": args.grounding_dino_model,
         "grounding_box_threshold": args.grounding_box_threshold,
         "grounding_text_threshold": args.grounding_text_threshold,
@@ -778,6 +802,7 @@ def launch_multi_gpu(args: argparse.Namespace, jobs: list[dict[str, Any]], gpu_i
             "--vlm_device_map", "cuda:0",
             "--strides", args.strides,
             "--target_mode", args.target_mode,
+            "--prealign_mode", args.prealign_mode,
             "--perturb_seed", str(args.perturb_seed),
             "--pre_align_min_confidence", str(args.pre_align_min_confidence),
             "--max_pre_align_rotation", str(args.max_pre_align_rotation),
@@ -800,20 +825,17 @@ def launch_multi_gpu(args: argparse.Namespace, jobs: list[dict[str, Any]], gpu_i
             cmd.append("--no_save_images")
         if args.quiet:
             cmd.append("--quiet")
-        if args.use_orient_anything:
-            cmd.append("--use_orient_anything")
+        if mode_uses_orient_anything(args.prealign_mode):
             cmd.extend(["--orient_anything_repo", str(args.orient_anything_repo)])
             cmd.extend(["--orient_anything_model_size", str(args.orient_anything_model_size)])
             if args.orient_anything_ckpt:
                 cmd.extend(["--orient_anything_ckpt", str(args.orient_anything_ckpt)])
             if args.orient_anything_cache_dir:
                 cmd.extend(["--orient_anything_cache_dir", str(args.orient_anything_cache_dir)])
-            if args.disable_grounding_dino:
-                cmd.append("--disable_grounding_dino")
-            if args.grounding_dino_cache_dir:
-                cmd.extend(
-                    ["--grounding_dino_cache_dir", str(args.grounding_dino_cache_dir)]
-                )
+        if args.grounding_dino_cache_dir:
+            cmd.extend(
+                ["--grounding_dino_cache_dir", str(args.grounding_dino_cache_dir)]
+            )
         print(f"[prealign-eval] start worker {worker_id} on GPU {gpu_id}", flush=True)
         procs.append(subprocess.Popen(cmd, env=env))
 
@@ -894,12 +916,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true")
 
     # Pre-align params (defaults mirror progressive_pose_edit.py).
+    parser.add_argument(
+        "--prealign_mode",
+        choices=ppe.PREALIGN_MODES,
+        default=None,
+        help=(
+            "Pre-align selection inputs: 'vlm'=full-frame VLM grid only; "
+            "'oa'=full-frame Orient Anything then VLM; "
+            "'grounding_dino'=folder-name Grounding DINO crops then VLM grid; "
+            "'oa_grounding_dino'=Grounding DINO crops + Orient Anything then VLM. "
+            "Default preserves legacy --use_orient_anything behavior."
+        ),
+    )
     parser.add_argument("--pre_align_min_confidence", type=float, default=0.60)
     parser.add_argument("--max_pre_align_rotation", type=float, default=30.0)
     parser.add_argument("--max_prealign_verify_attempts", type=int, default=0)
     parser.add_argument("--prealign_bruteforce_after_attempts", type=int, default=5)
 
-    # Optional Orient Anything.
+    # Legacy compatibility flags. Prefer --prealign_mode.
     parser.add_argument("--use_orient_anything", action="store_true")
     parser.add_argument("--orient_anything_repo", default=str(ppe.DEFAULT_ORIENT_ANYTHING_REPO))
     parser.add_argument("--orient_anything_ckpt", default=None)
@@ -914,8 +948,8 @@ def build_argparser() -> argparse.ArgumentParser:
         "--disable_grounding_dino",
         action="store_true",
         help=(
-            "Disable folder-name Grounding DINO crops. By default, --use_orient_anything "
-            "detects the sequence-named object before OA."
+            "Legacy flag: with --use_orient_anything and no --prealign_mode, select "
+            "full-frame OA instead of OA + Grounding DINO crops."
         ),
     )
     parser.add_argument(
@@ -937,6 +971,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    args.prealign_mode = resolve_prealign_mode(args)
     ppe.VERBOSE = not args.quiet
 
     frames_root = args.frames_root.expanduser().resolve()

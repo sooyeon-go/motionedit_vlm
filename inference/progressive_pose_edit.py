@@ -67,6 +67,11 @@ DEFAULT_ORIENT_ANYTHING_REPO = REPO_ROOT / "third_party" / "Orient-Anything"
 DEFAULT_ORIENT_ANYTHING_MODEL_SIZE = "large"
 DEFAULT_GROUNDING_DINO_REPO = REPO_ROOT / "third_party" / "GroundingDINO"
 DEFAULT_GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-tiny"
+PREALIGN_MODES = ("vlm", "oa", "grounding_dino", "oa_grounding_dino")
+_PREALIGN_MODE_ALIASES = {
+    "dino": "grounding_dino",
+    "oa_dino": "oa_grounding_dino",
+}
 
 AZIMUTH_BINS = [
     "front view",
@@ -3388,6 +3393,9 @@ def bruteforce_pre_align_source(
     target_img: Image.Image,
     planner_vlm: QwenVLMClient,
     output_dir: Path,
+    selection_source_img: Optional[Image.Image] = None,
+    selection_target_img: Optional[Image.Image] = None,
+    selection_mode: str = "full_frame",
 ) -> Optional[tuple[Image.Image, PreAlignDecision, dict[str, Any]]]:
     transforms, raw_count = enumerate_unique_coarse_orientation_transforms(source_img)
     if not transforms:
@@ -3402,14 +3410,29 @@ def bruteforce_pre_align_source(
     bruteforce_dir.mkdir(parents=True, exist_ok=True)
     save_image(source_img, bruteforce_dir / "00_input_source.png")
     save_image(target_img, bruteforce_dir / "01_target.png")
+    selection_source = selection_source_img or source_img
+    selection_target = selection_target_img or target_img
+    save_image(selection_source, bruteforce_dir / "00b_selection_source.png")
+    save_image(selection_target, bruteforce_dir / "01b_selection_target.png")
 
     candidates: list[Image.Image] = []
+    selection_candidates: list[Image.Image] = []
     candidate_records: list[dict[str, Any]] = []
     for transform in transforms:
         candidate = apply_coarse_orientation_transform(source_img, transform)
+        selection_candidate = apply_coarse_orientation_transform(
+            selection_source,
+            transform,
+        )
         candidates.append(candidate)
+        selection_candidates.append(selection_candidate)
         candidate_path = bruteforce_dir / f"candidate_{transform.candidate_id:02d}.png"
+        selection_candidate_path = (
+            bruteforce_dir
+            / f"candidate_{transform.candidate_id:02d}_selection_input.png"
+        )
         save_image(candidate, candidate_path)
+        save_image(selection_candidate, selection_candidate_path)
         candidate_records.append(
             {
                 "candidate_id": transform.candidate_id,
@@ -3417,11 +3440,16 @@ def bruteforce_pre_align_source(
                 "flip_vertical": transform.flip_vertical,
                 "rotation_degrees": transform.rotation_degrees,
                 "image_path": str(candidate_path),
+                "selection_image_path": str(selection_candidate_path),
             }
         )
 
     grid_columns = 4 if len(transforms) >= 4 else len(transforms)
-    grid = build_coarse_candidate_grid(candidates, transforms, columns=grid_columns)
+    grid = build_coarse_candidate_grid(
+        selection_candidates,
+        transforms,
+        columns=grid_columns,
+    )
     grid_path = bruteforce_dir / "candidate_grid.png"
     save_image(grid, grid_path)
 
@@ -3436,7 +3464,7 @@ def bruteforce_pre_align_source(
                     "type": "text",
                     "text": f"(IMAGE 1 = CANDIDATE GRID, IDs 0-{max_candidate_id})",
                 },
-                {"type": "image", "image": target_img},
+                {"type": "image", "image": selection_target},
                 {"type": "text", "text": "(IMAGE 2 = TARGET)"},
                 {
                     "type": "text",
@@ -3475,7 +3503,7 @@ def bruteforce_pre_align_source(
     ]
     save_image(
         build_labeled_image_grid(
-            candidates,
+            selection_candidates,
             detailed_captions,
             columns=grid_columns,
             selected_indices=visual_highlights,
@@ -3486,6 +3514,7 @@ def bruteforce_pre_align_source(
     if not can_select or best_id is None:
         payload = {
             "mode": "bruteforce_fallback",
+            "selection_mode": selection_mode,
             "num_raw_candidates": raw_count,
             "num_candidates": len(transforms),
             "best_candidate_id": None,
@@ -3511,17 +3540,19 @@ def bruteforce_pre_align_source(
         transform for transform in transforms if transform.candidate_id == best_id
     )
     aligned = candidates[best_id]
+    selected_selection_img = selection_candidates[best_id]
     save_image(
         build_labeled_image_grid(
-            [source_img, target_img, aligned],
+            [selection_source, selection_target, selected_selection_img, aligned],
             [
-                "INPUT SOURCE",
-                "TARGET",
-                f"VLM SELECTED id={best_id}\n{chosen_transform.label}",
+                f"SELECTION SOURCE\nmode={selection_mode}",
+                "SELECTION TARGET",
+                f"SELECTED INPUT id={best_id}\n{chosen_transform.label}",
+                "FULL-FRAME OUTPUT\nsame D4 transform",
             ],
-            columns=3,
+            columns=2,
             thumb_size=320,
-            selected_indices={2: (50, 220, 80)},
+            selected_indices={2: (50, 220, 80), 3: (50, 220, 80)},
         ),
         bruteforce_dir / "03_visual_vlm_selection_comparison.png",
     )
@@ -3538,6 +3569,7 @@ def bruteforce_pre_align_source(
     )
     payload = {
         "mode": "bruteforce_fallback",
+        "selection_mode": selection_mode,
         "num_raw_candidates": raw_count,
         "num_candidates": len(transforms),
         "best_candidate_id": best_id,
@@ -3688,19 +3720,40 @@ def pre_align_source_until_verified(
     grounding_box_threshold: float = 0.30,
     grounding_text_threshold: float = 0.25,
     grounding_crop_padding: float = 0.10,
+    prealign_mode: Optional[str] = None,
 ) -> tuple[Image.Image, PreAlignDecision, dict[str, Any]]:
     # Kept in the signature for compatibility with existing callers. The A→C
     # pipeline no longer performs landmark retries.
     del min_confidence, max_rotation, max_attempts, bruteforce_after_attempts
 
+    if prealign_mode is None:
+        if orient_anything is not None and grounding_dino is not None:
+            resolved_mode = "oa_grounding_dino"
+        elif orient_anything is not None:
+            resolved_mode = "oa"
+        elif grounding_dino is not None:
+            resolved_mode = "grounding_dino"
+        else:
+            resolved_mode = "vlm"
+    else:
+        resolved_mode = prealign_mode.strip().lower()
+    resolved_mode = _PREALIGN_MODE_ALIASES.get(resolved_mode, resolved_mode)
+    if resolved_mode not in PREALIGN_MODES:
+        raise ValueError(
+            f"Unsupported prealign_mode={prealign_mode!r}; choose one of {PREALIGN_MODES}"
+        )
+
+    use_oa = resolved_mode in {"oa", "oa_grounding_dino"}
+    use_grounding_dino = resolved_mode in {"grounding_dino", "oa_grounding_dino"}
+    log(f"\n[prealign] mode={resolved_mode}")
+
     oa_payload: Optional[dict[str, Any]] = None
     grounding_payload: Optional[dict[str, Any]] = None
     source_oa_img: Optional[Image.Image] = None
     target_oa_img: Optional[Image.Image] = None
-    fallback_reason = (
-        "Orient Anything is disabled; run visual candidate selection directly."
-    )
-    if orient_anything is not None:
+    fallback_reason = f"Mode {resolved_mode} uses visual candidate selection."
+
+    if use_grounding_dino:
         if grounding_dino is not None and object_prompt:
             try:
                 source_oa_img, target_oa_img, grounding_payload = prepare_grounded_oa_crops(
@@ -3715,12 +3768,13 @@ def pre_align_source_until_verified(
                 )
                 if source_oa_img is not None and target_oa_img is not None:
                     log(
-                        "[prealign:grounding-dino] Object crops ready for OA: "
+                        "[prealign:grounding-dino] Object crops ready: "
                         f"prompt={object_prompt!r}"
                     )
                 else:
                     log(
-                        "[prealign:grounding-dino] Detection incomplete; OA uses full frames."
+                        "[prealign:grounding-dino] Detection incomplete; "
+                        "visual/OA selection uses full frames."
                     )
             except Exception as exc:
                 source_oa_img = None
@@ -3730,7 +3784,9 @@ def pre_align_source_until_verified(
                     "object_prompt": object_prompt,
                     "success": False,
                     "error": str(exc),
-                    "fallback_reason": "Grounding DINO failed; OA uses full frames.",
+                    "fallback_reason": (
+                        "Grounding DINO failed; visual/OA selection uses full frames."
+                    ),
                 }
                 grounding_dir = output_dir / "prealign_grounding_dino"
                 grounding_dir.mkdir(parents=True, exist_ok=True)
@@ -3738,7 +3794,22 @@ def pre_align_source_until_verified(
                     json.dumps(grounding_payload, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
-                log(f"[prealign:grounding-dino] Failed; OA uses full frames: {exc}")
+                log(
+                    "[prealign:grounding-dino] Failed; "
+                    f"visual/OA selection uses full frames: {exc}"
+                )
+        else:
+            grounding_payload = {
+                "mode": "grounding_dino_object_crop",
+                "object_prompt": object_prompt,
+                "success": False,
+                "fallback_reason": (
+                    "Grounding DINO client or object prompt is unavailable; "
+                    "selection uses full frames."
+                ),
+            }
+
+    if use_oa and orient_anything is not None:
 
         try:
             oa_result = orient_anything_pre_align_source(
@@ -3758,6 +3829,7 @@ def pre_align_source_until_verified(
 
         if oa_result is not None:
             aligned, decision, oa_payload = oa_result
+            oa_payload["requested_pre_align_mode"] = resolved_mode
             oa_payload["grounding_dino"] = grounding_payload
             verify = verify_pre_alignment(source_img, aligned, target_img, decision, planner_vlm)
             save_prealign_verify_triptych(
@@ -3796,13 +3868,30 @@ def pre_align_source_until_verified(
                     fallback_reason = str(oa_payload.get("reason") or fallback_reason)
                 except (OSError, json.JSONDecodeError):
                     pass
+    elif use_oa:
+        fallback_reason = (
+            f"Mode {resolved_mode} requested Orient Anything, but its client is unavailable; "
+            "using visual candidate selection."
+        )
 
     log("\n========== Phase -1C: Visual D4 Candidate Selection ==========")
+    use_grounded_visual_selection = (
+        use_grounding_dino
+        and source_oa_img is not None
+        and target_oa_img is not None
+    )
     bruteforce_result = bruteforce_pre_align_source(
         source_img=source_img,
         target_img=target_img,
         planner_vlm=planner_vlm,
         output_dir=output_dir,
+        selection_source_img=source_oa_img if use_grounded_visual_selection else None,
+        selection_target_img=target_oa_img if use_grounded_visual_selection else None,
+        selection_mode=(
+            "grounding_dino_object_crop"
+            if use_grounded_visual_selection
+            else "full_frame"
+        ),
     )
     if bruteforce_result is None:
         decision = PreAlignDecision(
@@ -3813,6 +3902,7 @@ def pre_align_source_until_verified(
         )
         parsed = {
             "mode": "a_to_c_pre_align",
+            "requested_pre_align_mode": resolved_mode,
             "phase": "rolled_back",
             "orient_anything": oa_payload,
             "grounding_dino": grounding_payload,
@@ -3841,6 +3931,7 @@ def pre_align_source_until_verified(
     bruteforce_payload["verify"] = asdict(verify)
     parsed = {
         "mode": "a_to_c_pre_align",
+        "requested_pre_align_mode": resolved_mode,
         "phase": "bruteforce_fallback",
         "orient_anything": oa_payload,
         "grounding_dino": grounding_payload,
@@ -5633,7 +5724,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use_orient_anything",
         action="store_true",
-        help="Use vendored Orient Anything predictions as geometry hints during staged planning.",
+        help="Legacy alias for --prealign_mode oa.",
+    )
+    parser.add_argument(
+        "--prealign_mode",
+        choices=PREALIGN_MODES,
+        default=None,
+        help=(
+            "Pre-align inputs: vlm (full-frame VLM only), oa (full-frame OA + VLM), "
+            "grounding_dino (text-grounded crops + VLM), or oa_grounding_dino "
+            "(text-grounded crops + OA + VLM)."
+        ),
+    )
+    parser.add_argument(
+        "--grounding_object_prompt",
+        default=None,
+        help=(
+            "Text query for Grounding DINO in grounding_dino / oa_grounding_dino mode, "
+            "e.g. 'bear' or 'bike'."
+        ),
+    )
+    parser.add_argument(
+        "--grounding_dino_model",
+        default=DEFAULT_GROUNDING_DINO_MODEL,
+    )
+    parser.add_argument("--grounding_dino_cache_dir", default=None)
+    parser.add_argument("--grounding_box_threshold", type=float, default=0.30)
+    parser.add_argument("--grounding_text_threshold", type=float, default=0.25)
+    parser.add_argument("--grounding_crop_padding", type=float, default=0.10)
+    parser.add_argument(
+        "--disable_grounding_dino",
+        action="store_true",
+        help="Deprecated compatibility option; use --prealign_mode oa instead.",
     )
     parser.add_argument(
         "--orient_anything_repo",
@@ -6030,6 +6152,18 @@ def progressive_pose_edit_angle_lora_comparison(
 def main() -> None:
     global VERBOSE
     args = parse_args()
+    if args.prealign_mode is None:
+        args.prealign_mode = "oa" if args.use_orient_anything else "vlm"
+    if args.disable_grounding_dino and args.prealign_mode == "oa_grounding_dino":
+        args.prealign_mode = "oa"
+    if (
+        args.prealign_mode in {"grounding_dino", "oa_grounding_dino"}
+        and not args.grounding_object_prompt
+    ):
+        raise ValueError(
+            "--grounding_object_prompt is required for "
+            f"--prealign_mode {args.prealign_mode}"
+        )
     VERBOSE = not args.quiet
     torch.manual_seed(args.seed)
 
@@ -6060,10 +6194,13 @@ def main() -> None:
     log(f"  planner_vlm           = {args.planner_vlm}")
     log(f"  dinov2_model          = {args.dinov2_model}")
     log(f"  unimatch_ckpt         = {args.unimatch_ckpt}")
-    if args.use_orient_anything:
+    if args.prealign_mode in {"oa", "oa_grounding_dino"}:
         log(f"  orient_anything_repo  = {args.orient_anything_repo}")
         log(f"  orient_anything_ckpt  = {args.orient_anything_ckpt or '(auto-download)'}")
         log(f"  orient_anything_size  = {args.orient_anything_model_size}")
+    if args.prealign_mode in {"grounding_dino", "oa_grounding_dino"}:
+        log(f"  grounding_dino_model  = {args.grounding_dino_model}")
+        log(f"  grounding_prompt      = {args.grounding_object_prompt}")
 
     source_img = Image.open(args.source_image).convert("RGB")
     target_img = Image.open(args.target_image).convert("RGB")
@@ -6086,7 +6223,7 @@ def main() -> None:
     log(f"[load] Planner VLM ready ({time.time() - t0:.1f}s)")
 
     orient_anything: Optional[OrientAnythingClient] = None
-    if args.use_orient_anything:
+    if args.prealign_mode in {"oa", "oa_grounding_dino"}:
         log("[load] Orient Anything geometry estimator...")
         t0 = time.time()
         orient_anything = OrientAnythingClient(
@@ -6106,6 +6243,21 @@ def main() -> None:
         )
         log(f"[load] Orient Anything ready ({time.time() - t0:.1f}s)")
 
+    grounding_dino: Optional[GroundingDINOClient] = None
+    if args.prealign_mode in {"grounding_dino", "oa_grounding_dino"}:
+        log("[load] Grounding DINO object detector...")
+        t0 = time.time()
+        grounding_dino = GroundingDINOClient(
+            model_id=args.grounding_dino_model,
+            device=args.device,
+            cache_dir=(
+                Path(args.grounding_dino_cache_dir)
+                if args.grounding_dino_cache_dir is not None
+                else None
+            ),
+        )
+        log(f"[load] Grounding DINO ready ({time.time() - t0:.1f}s)")
+
     aligned_source_img = source_img
     pre_alignment: Optional[PreAlignDecision] = None
     if args.skip_pre_align:
@@ -6123,6 +6275,12 @@ def main() -> None:
             bruteforce_after_attempts=args.prealign_bruteforce_after_attempts,
             orient_anything=orient_anything,
             orient_confidence_threshold=args.orient_anything_confidence_threshold,
+            grounding_dino=grounding_dino,
+            object_prompt=args.grounding_object_prompt,
+            grounding_box_threshold=args.grounding_box_threshold,
+            grounding_text_threshold=args.grounding_text_threshold,
+            grounding_crop_padding=args.grounding_crop_padding,
+            prealign_mode=args.prealign_mode,
         )
         save_image(aligned_source_img, output_dir / "aligned_source.png")
         save_image(aligned_source_img, output_dir / "step_00.png")
