@@ -214,6 +214,93 @@ def rate(records: list[dict[str, Any]], key: str) -> float | None:
     return round(sum(1 for value in values if bool(value)) / len(values), 4)
 
 
+def record_used_grounding_dino(record: dict[str, Any]) -> bool:
+    requested_mode = str(
+        record.get("requested_prealign_mode")
+        or record.get("prealign_mode")
+        or ""
+    )
+    grounding = record.get("grounding_dino") or {}
+    return (
+        mode_uses_grounding_dino(requested_mode)
+        or grounding.get("enabled") is True
+        or record.get("grounding_crop_success") is not None
+        or grounding.get("success") is not None
+        or grounding.get("source_detection") is not None
+        or grounding.get("target_detection") is not None
+    )
+
+
+def grounding_detection_success(
+    record: dict[str, Any],
+    side: str,
+) -> bool | None:
+    """Return per-frame grounding success, or None when grounding was not attempted."""
+    if not record_used_grounding_dino(record):
+        return None
+
+    key = f"grounding_{side}_detection_success"
+    if key in record and record[key] is not None:
+        return bool(record[key])
+
+    grounding = record.get("grounding_dino") or {}
+    return grounding.get(f"{side}_detection") is not None
+
+
+def grounding_detection_success_rate(
+    records: list[dict[str, Any]],
+    side: str,
+) -> float | None:
+    values = [
+        success
+        for record in records
+        if (success := grounding_detection_success(record, side)) is not None
+    ]
+    if not values:
+        return None
+    return round(sum(1 for value in values if value) / len(values), 4)
+
+
+def backfill_grounding_detection_success(
+    record: dict[str, Any],
+    *,
+    default_prealign_mode: str | None = None,
+) -> None:
+    """Populate per-side grounding success keys for older jsonl records."""
+    if (
+        record.get("grounding_source_detection_success") is not None
+        and record.get("grounding_target_detection_success") is not None
+    ):
+        return
+
+    if default_prealign_mode and not record.get("requested_prealign_mode"):
+        record["requested_prealign_mode"] = default_prealign_mode
+
+    if not record_used_grounding_dino(record):
+        return
+
+    grounding = record.get("grounding_dino") or {}
+    if record.get("grounding_source_detection_success") is None:
+        record["grounding_source_detection_success"] = (
+            grounding.get("source_detection") is not None
+        )
+    if record.get("grounding_target_detection_success") is None:
+        record["grounding_target_detection_success"] = (
+            grounding.get("target_detection") is not None
+        )
+
+
+def normalize_grounding_record_fields(
+    record: dict[str, Any],
+    *,
+    default_prealign_mode: str | None = None,
+) -> None:
+    backfill_grounding_detection_success(
+        record,
+        default_prealign_mode=default_prealign_mode,
+    )
+
+
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     mode_counts: dict[str, int] = {}
     oa_measurement_mode_counts: dict[str, int] = {}
@@ -243,11 +330,11 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "num_samples": len(records),
         "recovery_rate": rate(records, "recovered"),
         "verify_apply_rate": rate(records, "verify_apply"),
-        "grounding_source_detection_success_rate": rate(
-            records, "grounding_source_detection_success"
+        "grounding_source_detection_success_rate": grounding_detection_success_rate(
+            records, "source"
         ),
-        "grounding_target_detection_success_rate": rate(
-            records, "grounding_target_detection_success"
+        "grounding_target_detection_success_rate": grounding_detection_success_rate(
+            records, "target"
         ),
         "grounding_crop_success_rate": rate(records, "grounding_crop_success"),
         "mode_counts": mode_counts,
@@ -386,7 +473,18 @@ def evaluate_sample(
     grounding_result = parsed.get("grounding_dino") or {}
     grounding_source_detection_success = None
     grounding_target_detection_success = None
-    if mode_uses_grounding_dino(prealign_mode):
+    if record_used_grounding_dino(
+        {
+            "requested_prealign_mode": prealign_mode,
+            "grounding_dino": {
+                "enabled": grounding_dino is not None,
+                "success": grounding_result.get("success"),
+                "source_detection": grounding_result.get("source_detection"),
+                "target_detection": grounding_result.get("target_detection"),
+            },
+            "grounding_crop_success": grounding_result.get("success"),
+        }
+    ):
         grounding_source_detection_success = grounding_result.get("source_detection") is not None
         grounding_target_detection_success = grounding_result.get("target_detection") is not None
     oa_result = (
@@ -651,25 +749,6 @@ def load_jsonl_records(jsonl_path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def backfill_grounding_detection_success(record: dict[str, Any]) -> None:
-    """Populate per-side grounding success keys for older jsonl records."""
-    if (
-        "grounding_source_detection_success" in record
-        and "grounding_target_detection_success" in record
-    ):
-        return
-    requested_mode = str(
-        record.get("requested_prealign_mode")
-        or record.get("prealign_mode")
-        or ""
-    )
-    if not mode_uses_grounding_dino(requested_mode):
-        return
-    grounding = record.get("grounding_dino") or {}
-    record["grounding_source_detection_success"] = grounding.get("source_detection") is not None
-    record["grounding_target_detection_success"] = grounding.get("target_detection") is not None
-
-
 def rebuild_summary_from_jsonl(
     *,
     jsonl_path: Path,
@@ -677,6 +756,11 @@ def rebuild_summary_from_jsonl(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     all_records = load_jsonl_records(jsonl_path)
+    for record in all_records:
+        normalize_grounding_record_fields(
+            record,
+            default_prealign_mode=args.prealign_mode,
+        )
     ok_records = [record for record in all_records if record.get("status") == "ok"]
     strides_from_data = sorted(
         {
@@ -717,6 +801,11 @@ def write_summary(
     all_records: list[dict[str, Any]],
     gpu_ids: list[int],
 ) -> dict[str, Any]:
+    for record in all_records:
+        normalize_grounding_record_fields(
+            record,
+            default_prealign_mode=args.prealign_mode,
+        )
     ok_records = [record for record in all_records if record.get("status") == "ok"]
     by_stride_records: dict[int, list[dict[str, Any]]] = {stride: [] for stride in strides}
     by_sequence_records: dict[str, list[dict[str, Any]]] = {}
@@ -790,6 +879,7 @@ def merge_jsonl_files(shard_paths: list[Path], out_path: Path) -> list[dict[str,
                     if not line:
                         continue
                     record = json.loads(line)
+                    normalize_grounding_record_fields(record)
                     records.append(record)
                     out_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     return records
